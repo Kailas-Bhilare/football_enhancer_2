@@ -1,45 +1,42 @@
 """
-Main entry point for the football video enhancer.
+Selection UI.
+
+Features:
+- click players to remove
+- pause on click
+- arrow keys for frame stepping
+- player IDs displayed
 """
 
 import cv2
+import json
 import argparse
-import numpy as np
 
 from config import *
 from models.detector import PlayerDetector
-from processing.effects import apply_translucency, create_debug_frame
 from processing.tracker import PlayerTracker
-from processing.opacity import calculate_batch_opacity
-from utils.visualization import draw_selection_overlay, draw_instructions, FPSCounter
 
 
 class AppState:
 
     def __init__(self):
 
-        self.effect_enabled = True
-
-        self.selected_players = set()
-        self.selected_tracked_ids = set()
+        self.selected_ids = set()
 
         self.current_boxes = []
-        self.current_masks = []
-
-        self.frame_shape = None
 
         self.tracker = None
 
-        self.show_debug = False
+        self.paused = False
 
-        self.fps_counter = FPSCounter()
+        self.current_frame = None
 
 
-def mouse_callback(event, x, y, flags, param):
-
-    state = param
+def mouse_callback(event, x, y, flags, state):
 
     if event == cv2.EVENT_LBUTTONDOWN:
+
+        state.paused = True
 
         for i, box in enumerate(state.current_boxes):
 
@@ -47,57 +44,85 @@ def mouse_callback(event, x, y, flags, param):
 
             if x1 <= x <= x2 and y1 <= y <= y2:
 
-                if state.tracker and i in state.tracker.id_mapping:
+                if i in state.tracker.id_mapping:
 
-                    tracked_id = state.tracker.id_mapping[i]
+                    pid = state.tracker.id_mapping[i]
 
-                    state.selected_tracked_ids.add(tracked_id)
+                    if pid not in state.selected_ids:
 
-                    state.selected_players = state.tracker.get_detection_indices(
-                        state.selected_tracked_ids
-                    )
+                        state.selected_ids.add(pid)
 
-                else:
-
-                    state.selected_players.add(i)
+                        print("Selected player", pid)
 
                 break
 
     elif event == cv2.EVENT_RBUTTONDOWN:
 
+        state.paused = True
+
         for i, box in enumerate(state.current_boxes):
 
             x1, y1, x2, y2 = map(int, box[:4])
 
             if x1 <= x <= x2 and y1 <= y <= y2:
 
-                if state.tracker and i in state.tracker.id_mapping:
+                if i in state.tracker.id_mapping:
 
-                    tracked_id = state.tracker.id_mapping[i]
+                    pid = state.tracker.id_mapping[i]
 
-                    if tracked_id in state.selected_tracked_ids:
+                    if pid in state.selected_ids:
 
-                        state.selected_tracked_ids.remove(tracked_id)
+                        state.selected_ids.remove(pid)
 
-                        state.selected_players = state.tracker.get_detection_indices(
-                            state.selected_tracked_ids
-                        )
-
-                else:
-
-                    if i in state.selected_players:
-                        state.selected_players.remove(i)
+                        print("Removed player", pid)
 
                 break
+
+
+def draw_boxes(frame, boxes, tracker, selected_ids):
+
+    output = frame.copy()
+
+    for i, box in enumerate(boxes):
+
+        x1, y1, x2, y2 = map(int, box[:4])
+
+        if i in tracker.id_mapping:
+
+            pid = tracker.id_mapping[i]
+
+            color = (0, 0, 255) if pid in selected_ids else (0, 255, 0)
+
+            cv2.rectangle(output, (x1, y1), (x2, y2), color, 2)
+
+            cv2.putText(
+                output,
+                f"ID {pid}",
+                (x1, y1 - 5),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                2,
+            )
+
+    return output
+
+
+def save_selection(ids):
+
+    data = {"selected_ids": list(ids)}
+
+    with open("selection.json", "w") as f:
+        json.dump(data, f, indent=2)
+
+    print("Saved selection.json")
 
 
 def main():
 
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--input", type=str, default=DEFAULT_VIDEO_PATH)
-    parser.add_argument("--no-track", action="store_true")
-    parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--input", type=str, required=True)
 
     args = parser.parse_args()
 
@@ -107,135 +132,89 @@ def main():
         print("Cannot open video")
         return
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-    print(f"Video loaded: {fps:.2f} fps | {total_frames} frames")
-
     detector = PlayerDetector(YOLO_MODEL_NAME, DETECTION_CLASSES)
 
-    tracker = PlayerTracker() if not args.no_track else None
+    tracker = PlayerTracker()
 
     state = AppState()
 
     state.tracker = tracker
-    state.show_debug = args.debug
 
     cv2.namedWindow(WINDOW_NAME)
 
     cv2.setMouseCallback(WINDOW_NAME, mouse_callback, state)
 
-    frame_count = 0
+    print("\nControls")
+    print("Left click  → select player")
+    print("Right click → unselect player")
+    print("Space       → pause/play")
+    print("→ arrow     → next frame")
+    print("← arrow     → previous frame")
+    print("S           → save selection")
+    print("Q           → quit\n")
 
     while True:
 
-        ret, frame = cap.read()
+        if not state.paused:
 
-        if not ret:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            continue
+            ret, frame = cap.read()
 
-        frame_count += 1
+            if not ret:
+                print("End of video")
+                break
 
-        state.frame_shape = frame.shape[:2]
+            state.current_frame = frame
+
+        frame = state.current_frame.copy()
 
         boxes, masks = detector.detect(frame)
 
-        state.fps_counter.update()
-
-        if tracker and boxes is not None and len(boxes) > 0:
+        if boxes is not None and len(boxes) > 0:
 
             id_mapping, tracked_boxes = tracker.update(boxes)
 
             state.current_boxes = tracked_boxes
 
-            state.selected_players = tracker.get_detection_indices(
-                state.selected_tracked_ids
-            )
-
-        else:
-
-            state.current_boxes = boxes if boxes is not None else []
-
-        state.current_masks = masks
-
-        if state.effect_enabled and boxes is not None and len(boxes) > 0:
-
-            output_frame = apply_translucency(
+            frame = draw_boxes(
                 frame,
-                boxes,
-                masks,
-                state.selected_players,
-                state.frame_shape,
+                tracked_boxes,
+                tracker,
+                state.selected_ids
             )
 
-        else:
+        cv2.imshow(WINDOW_NAME, frame)
 
-            output_frame = frame.copy()
-
-        output_frame = draw_selection_overlay(
-            output_frame,
-            state.current_boxes,
-            state.selected_players,
-        )
-
-        if state.show_debug and boxes is not None:
-
-            frame_area = state.frame_shape[0] * state.frame_shape[1]
-
-            opacities = calculate_batch_opacity(boxes, frame_area)
-
-            output_frame = create_debug_frame(
-                output_frame,
-                boxes,
-                masks,
-                opacities,
-                state.selected_players,
-            )
-
-        output_frame = state.fps_counter.draw(output_frame)
-
-        output_frame = draw_instructions(
-            output_frame,
-            state.effect_enabled,
-            len(state.selected_players),
-        )
-
-        cv2.putText(
-            output_frame,
-            f"Frame {frame_count}/{total_frames}",
-            (10, 60),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (200, 200, 200),
-            1,
-        )
-
-        cv2.imshow(WINDOW_NAME, output_frame)
-
-        key = cv2.waitKey(1) & 0xFF
+        key = cv2.waitKey(30) & 0xFF
 
         if key == KEY_QUIT:
             break
 
-        elif key == KEY_TOGGLE_EFFECT:
+        elif key == ord(" "):
+            state.paused = not state.paused
 
-            state.effect_enabled = not state.effect_enabled
+        elif key == 83:  # right arrow
 
-        elif key == KEY_DESELECT_ALL:
+            state.paused = True
 
-            state.selected_players.clear()
-            state.selected_tracked_ids.clear()
+            cap.set(
+                cv2.CAP_PROP_POS_FRAMES,
+                cap.get(cv2.CAP_PROP_POS_FRAMES) + 1
+            )
 
-        elif key == KEY_DEBUG_TOGGLE:
+        elif key == 81:  # left arrow
 
-            state.show_debug = not state.show_debug
+            state.paused = True
 
-        elif key == KEY_SAVE_FRAME:
+            pos = cap.get(cv2.CAP_PROP_POS_FRAMES)
 
-            cv2.imwrite(f"frame_{frame_count}.jpg", output_frame)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, max(pos - 2, 0))
+
+        elif key == ord("s"):
+
+            save_selection(state.selected_ids)
 
     cap.release()
+
     cv2.destroyAllWindows()
 
 

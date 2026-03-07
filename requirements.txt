@@ -4,3 +4,8 @@ torchvision
 ultralytics
 numpy
 scipy
+diffusers
+transformers
+accelerate
+xformers
+pillow

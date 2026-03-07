@@ -1,26 +1,21 @@
 """
 Player detection module using YOLOv8 segmentation.
-Handles loading the model and running inference on frames.
+Detects players and returns bounding boxes + masks aligned to the frame.
 """
 
 import cv2
 import numpy as np
-from ultralytics import YOLO
 import torch
+from ultralytics import YOLO
 
 
 class PlayerDetector:
-    """
-    Detect players in frames using YOLOv8 segmentation.
-    Returns bounding boxes and segmentation masks aligned with the frame.
-    """
 
     def __init__(self, model_name="yolov8m-seg.pt", classes=[0], device=None):
         """
-        Args:
-            model_name: YOLO model path
-            classes: COCO classes to detect (0 = person)
-            device: 'cuda' or 'cpu'
+        model_name: YOLO segmentation model
+        classes: COCO classes to detect (0 = person)
+        device: 'cuda' or 'cpu'
         """
 
         if device is None:
@@ -29,6 +24,7 @@ class PlayerDetector:
             self.device = device
 
         print(f"Loading YOLO model on {self.device}...")
+
         self.model = YOLO(model_name)
 
         self.classes = classes
@@ -40,6 +36,7 @@ class PlayerDetector:
         Run detection on frame.
 
         Returns
+        -------
         boxes : numpy array (N,4)
         masks : numpy array (N,H,W) or None
         """
@@ -64,6 +61,7 @@ class PlayerDetector:
         if results.masks is not None:
 
             raw_masks = results.masks.data.detach().cpu().numpy()
+
             frame_h, frame_w = frame.shape[:2]
 
             resized_masks = []
@@ -77,6 +75,7 @@ class PlayerDetector:
                 )
 
                 mask = (mask > 0.5).astype(np.uint8)
+
                 resized_masks.append(mask)
 
             masks = np.array(resized_masks)
@@ -85,7 +84,7 @@ class PlayerDetector:
 
     def detect_resized(self, frame, size=640):
         """
-        Faster detection using resized inference.
+        Faster detection by resizing frame before inference.
         """
 
         h, w = frame.shape[:2]

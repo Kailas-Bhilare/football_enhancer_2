@@ -1,6 +1,7 @@
 """
-Player tracking module.
-Maintains consistent IDs across frames using IoU matching.
+Simple player tracker using IoU matching.
+
+Maintains consistent player IDs across frames.
 """
 
 import numpy as np
@@ -9,12 +10,13 @@ from scipy.optimize import linear_sum_assignment
 
 class PlayerTracker:
 
-    def __init__(self, iou_threshold=0.3, max_lost_frames=5):
+    def __init__(self, iou_threshold=0.3, max_lost_frames=10):
 
         self.iou_threshold = iou_threshold
         self.max_lost_frames = max_lost_frames
 
         self.next_id = 0
+
         self.tracked_players = {}
         self.id_mapping = {}
 
@@ -146,16 +148,6 @@ class PlayerTracker:
                 tracked_boxes.append(detections[di])
 
         return self.id_mapping, tracked_boxes
-
-    def get_selected_ids(self, selected_indices):
-
-        ids = set()
-
-        for idx in selected_indices:
-            if idx in self.id_mapping:
-                ids.add(self.id_mapping[idx])
-
-        return ids
 
     def get_detection_indices(self, selected_ids):
 

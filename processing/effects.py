@@ -1,42 +1,54 @@
 """
-Visual effects module.
-Handles translucency and prepares masks for future inpainting.
+Mask generation utilities with temporal smoothing.
 """
 
-import cv2
 import numpy as np
-from config import SELECTED_PLAYER_OPACITY
+import cv2
+from collections import deque
 
 
-def apply_translucency(frame, boxes, masks, selected_players, frame_shape):
+class TemporalMaskSmoother:
     """
-    Apply translucency to selected players.
-
-    Args:
-        frame
-        boxes
-        masks
-        selected_players
-        frame_shape
-
-    Returns
-        processed frame
+    Smooth masks across frames to reduce flicker.
+    Keeps last N masks and averages them.
     """
 
-    if boxes is None or len(boxes) == 0:
-        return frame.copy()
+    def __init__(self, history=5):
+        self.history = history
+        self.buffer = deque(maxlen=history)
 
-    if not selected_players:
-        return frame.copy()
+    def smooth(self, mask):
+        """
+        mask: binary mask (H,W)
+        """
+
+        self.buffer.append(mask.astype(np.float32))
+
+        stacked = np.stack(self.buffer, axis=0)
+
+        avg_mask = np.mean(stacked, axis=0)
+
+        # threshold back to binary
+        smoothed = (avg_mask > 0.4).astype(np.uint8)
+
+        return smoothed
+
+
+def create_player_removal_mask(
+    frame_shape,
+    boxes,
+    masks,
+    selected_indices,
+):
 
     h, w = frame_shape
 
-    result = frame.copy()
+    combined = np.zeros((h, w), dtype=np.uint8)
 
-    if masks is None:
-        return result
+    if masks is None or len(masks) == 0:
+        return combined
 
-    for idx in selected_players:
+    for idx in selected_indices:
 
         if idx >= len(masks):
             continue
@@ -46,68 +58,32 @@ def apply_translucency(frame, boxes, masks, selected_players, frame_shape):
         if mask.shape != (h, w):
             mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
 
-        mask = mask.astype(np.float32)
+        combined = np.maximum(combined, mask.astype(np.uint8))
 
-        alpha = SELECTED_PLAYER_OPACITY
-
-        mask_3 = np.repeat(mask[:, :, None], 3, axis=2)
-
-        result = result * (1 - mask_3) + (result * alpha) * mask_3
-
-    result = result.astype(np.uint8)
-
-    return result
+    return combined
 
 
-def create_debug_frame(frame, boxes, masks, opacities, selected_players):
+def draw_selected_players(frame, boxes, selected_indices):
 
-    debug = frame.copy()
+    output = frame.copy()
 
-    if boxes is None or len(boxes) == 0:
+    for i in selected_indices:
+
+        if i >= len(boxes):
+            continue
+
+        x1, y1, x2, y2 = map(int, boxes[i][:4])
+
+        cv2.rectangle(output, (x1, y1), (x2, y2), (0, 0, 255), 3)
+
         cv2.putText(
-            debug,
-            "No players detected",
-            (40, 40),
+            output,
+            "REMOVE",
+            (x1, y1 - 5),
             cv2.FONT_HERSHEY_SIMPLEX,
-            1,
+            0.6,
             (0, 0, 255),
             2,
         )
-        return debug
 
-    for i, box in enumerate(boxes):
-
-        x1, y1, x2, y2 = map(int, box[:4])
-
-        if i in selected_players:
-            color = (0, 0, 255)
-            label = "SELECTED"
-        else:
-            color = (0, 255, 0)
-            label = f"{i}"
-
-        cv2.rectangle(debug, (x1, y1), (x2, y2), color, 2)
-
-        cv2.putText(
-            debug,
-            label,
-            (x1, y1 - 5),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            color,
-            1,
-        )
-
-        if opacities is not None and i < len(opacities):
-
-            cv2.putText(
-                debug,
-                f"{opacities[i]:.2f}",
-                (x1, y2 + 15),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                (255, 255, 0),
-                1,
-            )
-
-    return debug
+    return output
