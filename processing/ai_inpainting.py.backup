@@ -1,0 +1,271 @@
+"""
+AI-based inpainting using lightweight models compatible with PyTorch.
+"""
+
+import cv2
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from collections import OrderedDict
+import os
+import urllib.request
+
+
+class SimpleInpaintingModel(nn.Module):
+    """
+    A lightweight inpainting model based on partial convolutions.
+    This is a simplified version that can run in real-time.
+    """
+    
+    def __init__(self):
+        super(SimpleInpaintingModel, self).__init__()
+        
+        # Encoder
+        self.enc1 = nn.Sequential(
+            nn.Conv2d(4, 64, kernel_size=5, stride=2, padding=2),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True)
+        )
+        self.enc2 = nn.Sequential(
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True)
+        )
+        self.enc3 = nn.Sequential(
+            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Decoder
+        self.dec3 = nn.Sequential(
+            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True)
+        )
+        self.dec2 = nn.Sequential(
+            nn.ConvTranspose2d(256, 64, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True)
+        )
+        self.dec1 = nn.Sequential(
+            nn.ConvTranspose2d(128, 3, kernel_size=4, stride=2, padding=1),
+            nn.Tanh()
+        )
+        
+    def forward(self, image, mask):
+        """
+        Args:
+            image: (B, 3, H, W) normalized to [-1, 1]
+            mask: (B, 1, H, W) binary mask (1 for missing regions)
+        """
+        # Concatenate image and mask
+        x = torch.cat([image, mask], dim=1)
+        
+        # Encode
+        e1 = self.enc1(x)
+        e2 = self.enc2(e1)
+        e3 = self.enc3(e2)
+        
+        # Decode with skip connections
+        d3 = self.dec3(e3)
+        d3 = torch.cat([d3, e2], dim=1)
+        
+        d2 = self.dec2(d3)
+        d2 = torch.cat([d2, e1], dim=1)
+        
+        d1 = self.dec1(d2)
+        
+        # Apply mask: keep original where mask=0, use inpainted where mask=1
+        output = image * (1 - mask) + d1 * mask
+        
+        return output
+
+
+class RealTimeInpainter:
+    """
+    Real-time inpainting using a lightweight model.
+    Falls back to OpenCV if model not available.
+    """
+    
+    def __init__(self, use_ai=True, model_path=None):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.use_ai = use_ai and torch.cuda.is_available()
+        self.model = None
+        self.fallback_count = 0
+        
+        if self.use_ai:
+            try:
+                self.model = SimpleInpaintingModel().to(self.device)
+                self.model.eval()
+                print(f"✅ AI Inpainting model loaded on {self.device}")
+                
+                # Try to load pretrained weights if available
+                if model_path and os.path.exists(model_path):
+                    self.model.load_state_dict(torch.load(model_path))
+                    print(f"Loaded weights from {model_path}")
+                else:
+                    print("⚠️  Using untrained model (will use OpenCV fallback)")
+                    self.use_ai = False
+                    
+            except Exception as e:
+                print(f"⚠️  Failed to load AI model: {e}")
+                print("Falling back to OpenCV inpainting")
+                self.use_ai = False
+        else:
+            print("Using OpenCV inpainting (faster, good for prototyping)")
+    
+    def inpaint(self, image, mask, method='telea', radius=3):
+        """
+        Inpaint image using either AI or OpenCV.
+        
+        Args:
+            image: numpy array (H, W, 3) in BGR format
+            mask: numpy array (H, W) binary mask (0 or 255, 255 = region to inpaint)
+            method: 'telea', 'ns', or 'auto'
+            radius: inpainting radius for OpenCV
+        
+        Returns:
+            inpainted image
+        """
+        # If AI is enabled and we have a model, try AI inpainting
+        if self.use_ai and self.model is not None and method == 'auto':
+            try:
+                return self._ai_inpaint(image, mask)
+            except Exception as e:
+                self.fallback_count += 1
+                if self.fallback_count < 5:  # Only print first few errors
+                    print(f"AI inpainting failed, falling back to OpenCV: {e}")
+        
+        # Fallback to OpenCV inpainting
+        return self._opencv_inpaint(image, mask, method, radius)
+    
+    def _ai_inpaint(self, image, mask):
+        """AI-based inpainting."""
+        # Convert BGR to RGB
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # Prepare tensors
+        h, w = image.shape[:2]
+        
+        # Resize to multiple of 8 for better performance
+        new_h = ((h + 7) // 8) * 8
+        new_w = ((w + 7) // 8) * 8
+        
+        if new_h != h or new_w != w:
+            image_resized = cv2.resize(image_rgb, (new_w, new_h))
+            mask_resized = cv2.resize(mask, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+        else:
+            image_resized = image_rgb
+            mask_resized = mask
+        
+        # Normalize to [-1, 1]
+        image_tensor = torch.from_numpy(image_resized).float().permute(2, 0, 1).unsqueeze(0) / 127.5 - 1
+        mask_tensor = torch.from_numpy(mask_resized).float().unsqueeze(0).unsqueeze(0) / 255.0
+        
+        # Move to device
+        image_tensor = image_tensor.to(self.device)
+        mask_tensor = mask_tensor.to(self.device)
+        
+        # Run inference
+        with torch.no_grad():
+            output_tensor = self.model(image_tensor, mask_tensor)
+        
+        # Convert back to numpy
+        output = output_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy()
+        output = ((output + 1) * 127.5).clip(0, 255).astype(np.uint8)
+        
+        # Resize back if needed
+        if new_h != h or new_w != w:
+            output = cv2.resize(output, (w, h))
+        
+        # Convert back to BGR
+        output = cv2.cvtColor(output, cv2.COLOR_RGB2BGR)
+        
+        return output
+    
+    def _opencv_inpaint(self, image, mask, method, radius):
+        """OpenCV-based inpainting."""
+        if method == 'telea':
+            flags = cv2.INPAINT_TELEA
+        else:
+            flags = cv2.INPAINT_NS
+        
+        return cv2.inpaint(image, mask, radius, flags)
+
+
+class BackgroundEstimator:
+    """
+    Estimates background by averaging frames over time.
+    Useful for static camera shots.
+    """
+    
+    def __init__(self, num_frames=30, learning_rate=0.05):
+        self.num_frames = num_frames
+        self.learning_rate = learning_rate
+        self.background = None
+        self.frame_count = 0
+    
+    def update(self, frame, mask=None):
+        """
+        Update background model with new frame.
+        
+        Args:
+            frame: Current frame
+            mask: Optional mask to exclude moving objects
+        """
+        frame_float = frame.astype(np.float32)
+        
+        if self.background is None:
+            self.background = frame_float.copy()
+        else:
+            if mask is not None:
+                # Only update background where mask is 0 (non-player regions)
+                mask_3channel = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR) / 255.0
+                update_factor = self.learning_rate * (1 - mask_3channel)
+                self.background = self.background * (1 - update_factor) + frame_float * update_factor
+            else:
+                # Simple exponential moving average
+                self.background = (1 - self.learning_rate) * self.background + self.learning_rate * frame_float
+        
+        self.frame_count += 1
+        return self.background.astype(np.uint8)
+    
+    def get_background(self):
+        """Get current background estimate."""
+        if self.background is None:
+            return None
+        return self.background.astype(np.uint8)
+
+
+# For even better results, you can use LaMa (but requires separate download)
+class LaMaInpainter:
+    """
+    LaMa inpainting model wrapper.
+    Note: You need to download the model separately.
+    """
+    
+    def __init__(self, model_path='lama.pt'):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model = None
+        self.available = False
+        
+        if os.path.exists(model_path):
+            try:
+                # Load LaMa model (you'd need to implement this)
+                # self.model = torch.jit.load(model_path)
+                # self.model.to(self.device)
+                # self.model.eval()
+                # self.available = True
+                print("LaMa model found but not implemented yet")
+            except:
+                pass
+        
+        if not self.available:
+            print("LaMa not available, using fallback")
+    
+    def inpaint(self, image, mask):
+        """Placeholder for LaMa inpainting."""
+        # Implement LaMa inference here if you download the model
+        return cv2.inpaint(image, mask, 3, cv2.INPAINT_TELEA)
