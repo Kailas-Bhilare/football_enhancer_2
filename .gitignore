@@ -11,3 +11,82 @@ data/
 # outputs
 runs/
 outputs/
+
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.env/
+env/
+.venv/
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDEs / Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# Environment variables
+.env
+*.env
+
+# Model weights (large files)
+*.pt
+*.pth
+*.onnx
+
+# Videos / outputs
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Generated outputs
+results/
+output/
+runs/
+
+# Temporary files
+*.tmp
+*.bak
+
+# JSON outputs (optional - comment if needed)
+# *.json
+
+# Cache / torch / ultralytics
+.cache/
+ultralytics/
+wandb/
+
+# Mac/Linux hidden files
+.*.swp
