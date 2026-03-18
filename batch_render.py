@@ -1,5 +1,4 @@
 import cv2
-import os
 import json
 import argparse
 import numpy as np
@@ -7,19 +6,21 @@ import numpy as np
 from config import *
 from models.detector import PlayerDetector
 from processing.tracker import PlayerTracker
-from processing.effects import create_player_removal_mask
+from processing.effects import (
+    TemporalMaskSmoother,
+    TemporalRemovalComposer,
+    create_player_removal_mask,
+    stabilize_mask,
+)
 from processing.sd_inpainting import SDInpainter
+
+
+SD_BLEND_ALPHA = 0.2
 
 
 def load_selection():
     with open("selection.json", "r") as f:
         return set(json.load(f)["selected_ids"])
-
-
-def smooth_mask(mask):
-    mask = cv2.dilate(mask, np.ones((5,5),np.uint8),1)
-    mask = cv2.GaussianBlur(mask,(15,15),0)
-    return (mask>0.25).astype(np.uint8)
 
 
 def resize_for_sd(frame, mask, size=256):
@@ -34,6 +35,13 @@ def resize_for_sd(frame, mask, size=256):
 
 def upscale_back(frame_small, orig_size):
     return cv2.resize(frame_small, orig_size)
+
+
+def blend_sd_result(base_output, sd_output, mask, alpha=SD_BLEND_ALPHA):
+    mask = (mask > 0).astype(np.float32)[..., None]
+    refined = cv2.addWeighted(base_output, 1.0 - alpha, sd_output, alpha, 0)
+    output = base_output.astype(np.float32) * (1.0 - mask) + refined.astype(np.float32) * mask
+    return np.clip(output, 0, 255).astype(np.uint8)
 
 
 def main():
@@ -62,8 +70,9 @@ def main():
     detector = PlayerDetector(YOLO_MODEL_NAME, DETECTION_CLASSES)
     tracker = PlayerTracker()
     sd = SDInpainter()
+    mask_smoother = TemporalMaskSmoother(history=5)
+    composer = TemporalRemovalComposer(blend_alpha=0.35, feather_radius=31)
 
-    prev_output = None
     frame_idx = 0
 
     while True:
@@ -74,7 +83,7 @@ def main():
 
         frame_idx += 1
 
-        boxes, masks = detector.detect(frame)
+        boxes, detector_masks = detector.detect(frame)
 
         if boxes is None or len(boxes) == 0:
             writer.write(frame)
@@ -87,28 +96,23 @@ def main():
         mask = create_player_removal_mask(
             frame.shape[:2],
             boxes,
-            masks,
-            selected_indices
+            detector_masks,
+            selected_indices,
         )
 
-        mask = smooth_mask(mask)
+        mask = stabilize_mask(mask)
+        mask = mask_smoother.smooth(mask)
 
         if np.sum(mask) > 0:
 
             small_frame, small_mask, orig_size = resize_for_sd(frame, mask)
-
             output_small = sd.inpaint(small_frame, small_mask)
-
             output = upscale_back(output_small, orig_size)
+            output = blend_sd_result(frame, output, mask)
+            output = composer.compose(frame, output, mask)
 
         else:
             output = frame.copy()
-
-        # temporal smoothing
-        if prev_output is not None:
-            output = cv2.addWeighted(prev_output, 0.7, output, 0.3, 0)
-
-        prev_output = output.copy()
 
         writer.write(output.astype(np.uint8))
 
