@@ -7,58 +7,24 @@ import torch
 from config import *
 from models.detector import PlayerDetector
 from processing.tracker import PlayerTracker
-from processing.effects import create_player_removal_mask
+from processing.effects import (
+    TemporalMaskSmoother,
+    TemporalRemovalComposer,
+    create_player_removal_mask,
+    stabilize_mask,
+)
 from processing.sd_inpainting import SDInpainter
 from processing.sam_refiner import SAMRefiner
 
 
 SD_INTERVAL = 12
-MASK_HISTORY = 4
-BLEND_ALPHA = 0.6
+MASK_HISTORY = 5
+SD_BLEND_ALPHA = 0.2
 
 
 def load_selection():
     with open("selection.json", "r") as f:
         return set(json.load(f)["selected_ids"])
-
-
-def smooth_mask(mask):
-    kernel = np.ones((5, 5), np.uint8)
-    mask = cv2.dilate(mask, kernel, 1)
-    mask = cv2.GaussianBlur(mask.astype(np.float32), (15, 15), 0)
-    return (mask > 0.25).astype(np.uint8)
-
-
-def refine_mask(mask):
-    kernel = np.ones((7, 7), np.uint8)
-    return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
-
-def temporal_mask(mask_history, new_mask):
-    mask_history.append(new_mask)
-
-    if len(mask_history) > MASK_HISTORY:
-        mask_history.pop(0)
-
-    combined = np.zeros_like(new_mask, dtype=np.float32)
-
-    for i, m in enumerate(mask_history):
-        weight = (i + 1) / len(mask_history)  # weighted smoothing
-        combined += m * weight
-
-    combined = combined / combined.max() if combined.max() > 0 else combined
-
-    return (combined > 0.3).astype(np.uint8)
-
-
-def blend_frames(prev, curr):
-    if prev is None:
-        return curr
-
-    if prev.shape != curr.shape:
-        curr = cv2.resize(curr, (prev.shape[1], prev.shape[0]))
-
-    return cv2.addWeighted(prev, BLEND_ALPHA, curr, 1 - BLEND_ALPHA, 0)
 
 
 def normalize_frame(frame, width, height):
@@ -69,6 +35,19 @@ def normalize_frame(frame, width, height):
         frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
 
     return frame.astype(np.uint8)
+
+
+def blend_sd_result(base_output, sd_output, mask, alpha=SD_BLEND_ALPHA):
+    if sd_output is None:
+        return base_output
+
+    if sd_output.shape != base_output.shape:
+        sd_output = cv2.resize(sd_output, (base_output.shape[1], base_output.shape[0]))
+
+    mask = (mask > 0).astype(np.float32)[..., None]
+    refined = cv2.addWeighted(base_output, 1.0 - alpha, sd_output, alpha, 0)
+    output = base_output.astype(np.float32) * (1.0 - mask) + refined.astype(np.float32) * mask
+    return np.clip(output, 0, 255).astype(np.uint8)
 
 
 def main():
@@ -99,9 +78,8 @@ def main():
     tracker = PlayerTracker()
     inpainter = SDInpainter()
     sam = SAMRefiner()
-
-    mask_history = []
-    prev_output = None
+    mask_smoother = TemporalMaskSmoother(history=MASK_HISTORY)
+    composer = TemporalRemovalComposer(blend_alpha=0.35, feather_radius=31)
 
     frame_idx = 0
 
@@ -113,7 +91,7 @@ def main():
 
         frame_idx += 1
 
-        boxes, _ = detector.detect(frame)
+        boxes, detector_masks = detector.detect(frame)
 
         if boxes is None or len(boxes) == 0:
             writer.write(frame)
@@ -121,52 +99,47 @@ def main():
 
         tracker.update(boxes)
 
-        # SAM masks
-        masks = sam.refine(frame, boxes)
-
+        sam_masks = sam.refine(frame, boxes)
         selected_indices = tracker.get_detection_indices(selected_ids)
 
         mask = create_player_removal_mask(
             frame.shape[:2],
             boxes,
-            masks,
-            selected_indices
+            sam_masks,
+            selected_indices,
+            auxiliary_masks=detector_masks,
         )
 
-        # mask pipeline
-        mask = smooth_mask(mask)
-        mask = refine_mask(mask)
-        mask = temporal_mask(mask_history, mask)
+        mask = stabilize_mask(mask)
+        mask = mask_smoother.smooth(mask)
 
         if np.sum(mask) > 0:
 
             mask255 = (mask * 255).astype(np.uint8)
 
-            # fast base inpainting
-            output = cv2.inpaint(
+            base_output = cv2.inpaint(
                 frame,
                 mask255,
-                3,
+                5,
                 cv2.INPAINT_TELEA
             )
 
-            # SD refinement occasionally
+            output = base_output
+
             if frame_idx % SD_INTERVAL == 0:
-                output = inpainter.inpaint(output, mask)
+                sd_output = inpainter.inpaint(base_output, mask)
+                output = blend_sd_result(base_output, sd_output, mask)
                 torch.cuda.empty_cache()
+
+            output = composer.compose(frame, output, mask)
 
         else:
             output = frame.copy()
 
         output = normalize_frame(output, width, height)
-
-        # temporal frame blending (removes flicker trails)
-        output = blend_frames(prev_output, output)
-        prev_output = output.copy()
-
         writer.write(output)
 
-        percent = frame_idx / total * 100
+        percent = frame_idx / total * 100 if total else 0
         print(f"\rProcessing {percent:5.1f}%  Frame {frame_idx}/{total}", end="")
 
     cap.release()

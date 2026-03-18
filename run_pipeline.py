@@ -13,7 +13,7 @@ def run_selection(input_video):
         input_video
     ]
 
-    subprocess.run(cmd)
+    subprocess.run(cmd, check=True)
 
     if not os.path.exists("selection.json"):
         raise RuntimeError("selection.json not created. Selection step failed.")
@@ -31,7 +31,7 @@ def run_render(input_video, output_video):
         output_video
     ]
 
-    subprocess.run(cmd)
+    subprocess.run(cmd, check=True)
 
 
 def main():
