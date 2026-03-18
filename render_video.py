@@ -78,6 +78,7 @@ def main():
     tracker = PlayerTracker()
     inpainter = SDInpainter()
     sam = SAMRefiner()
+
     mask_smoother = TemporalMaskSmoother(history=MASK_HISTORY)
     composer = TemporalRemovalComposer(blend_alpha=0.35, feather_radius=31)
 
