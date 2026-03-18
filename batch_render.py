@@ -70,6 +70,8 @@ def main():
     detector = PlayerDetector(YOLO_MODEL_NAME, DETECTION_CLASSES)
     tracker = PlayerTracker()
     sd = SDInpainter()
+
+    # Updated flicker-reduction settings
     mask_smoother = TemporalMaskSmoother(history=5)
     composer = TemporalRemovalComposer(blend_alpha=0.35, feather_radius=31)
 
