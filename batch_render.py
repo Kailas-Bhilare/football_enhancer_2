@@ -83,7 +83,7 @@ def main():
 
         frame_idx += 1
 
-        boxes, masks = detector.detect(frame)
+        boxes, detector_masks = detector.detect(frame)
 
         if boxes is None or len(boxes) == 0:
             writer.write(frame)
@@ -96,8 +96,8 @@ def main():
         mask = create_player_removal_mask(
             frame.shape[:2],
             boxes,
-            masks,
-            selected_indices
+            detector_masks,
+            selected_indices,
         )
 
         mask = stabilize_mask(mask)
