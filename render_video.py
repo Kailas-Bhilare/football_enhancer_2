@@ -18,8 +18,8 @@ from processing.sam_refiner import SAMRefiner
 
 
 SD_INTERVAL = 12
-MASK_HISTORY = 5
-SD_BLEND_ALPHA = 0.2
+MASK_HISTORY = 4
+SD_BLEND_ALPHA = 0.25
 
 
 def load_selection():
@@ -79,7 +79,7 @@ def main():
     inpainter = SDInpainter()
     sam = SAMRefiner()
     mask_smoother = TemporalMaskSmoother(history=MASK_HISTORY)
-    composer = TemporalRemovalComposer(blend_alpha=0.35, feather_radius=31)
+    composer = TemporalRemovalComposer(blend_alpha=0.3, feather_radius=25)
 
     frame_idx = 0
 
@@ -99,7 +99,7 @@ def main():
 
         tracker.update(boxes)
 
-        sam_masks = sam.refine(frame, boxes)
+        masks = sam.refine(frame, boxes)
         selected_indices = tracker.get_detection_indices(selected_ids)
 
         mask = create_player_removal_mask(

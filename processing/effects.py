@@ -10,17 +10,15 @@ from collections import deque
 class TemporalMaskSmoother:
     """
     Smooth masks across frames to reduce flicker.
-    Maintains a short history plus a decaying temporal state so the mask does
-    not disappear immediately when a frame under-segments the player.
+    Keeps a short history and uses hysteresis to avoid masks popping.
     """
 
-    def __init__(self, history=5, threshold=0.4, decay=0.7, close_size=5):
+    def __init__(self, history=5, threshold=0.35, persistence=0.15):
         self.history = history
         self.threshold = threshold
-        self.decay = decay
-        self.close_size = close_size
+        self.persistence = persistence
         self.buffer = deque(maxlen=history)
-        self.state = None
+        self.prev_mask = None
 
     def smooth(self, mask):
         """
@@ -30,18 +28,17 @@ class TemporalMaskSmoother:
         mask = (mask > 0).astype(np.uint8)
         self.buffer.append(mask.astype(np.float32))
 
-        averaged = np.mean(np.stack(self.buffer, axis=0), axis=0)
+        stacked = np.stack(self.buffer, axis=0)
+        avg_mask = np.mean(stacked, axis=0)
 
-        if self.state is None:
-            self.state = averaged
-        else:
-            self.state = np.maximum(averaged, self.state * self.decay)
+        if self.prev_mask is not None:
+            avg_mask = np.maximum(
+                avg_mask,
+                self.prev_mask.astype(np.float32) * self.persistence,
+            )
 
-        smoothed = (self.state >= self.threshold).astype(np.uint8)
-
-        if self.close_size > 1:
-            kernel = np.ones((self.close_size, self.close_size), np.uint8)
-            smoothed = cv2.morphologyEx(smoothed, cv2.MORPH_CLOSE, kernel)
+        smoothed = (avg_mask >= self.threshold).astype(np.uint8)
+        self.prev_mask = smoothed
 
         return smoothed
 
@@ -116,32 +113,9 @@ def feather_mask(mask, blur_size=21):
     return np.clip(alpha, 0.0, 1.0)
 
 
-def mask_from_box(box, frame_shape, pad_ratio=0.08, pad_px=6):
+def stabilize_mask(mask, dilate_size=5, blur_size=15, close_size=7):
     """
-    Build a conservative bbox support mask to cover limbs missed by segmenters.
-    """
-
-    h, w = frame_shape
-    x1, y1, x2, y2 = map(int, box[:4])
-
-    pad_x = max(int((x2 - x1) * pad_ratio), pad_px)
-    pad_y = max(int((y2 - y1) * pad_ratio), pad_px)
-
-    x1 = max(0, x1 - pad_x)
-    y1 = max(0, y1 - pad_y)
-    x2 = min(w, x2 + pad_x)
-    y2 = min(h, y2 + pad_y)
-
-    support = np.zeros((h, w), dtype=np.uint8)
-    support[y1:y2, x1:x2] = 1
-
-    return support
-
-
-def stabilize_mask(mask, dilate_size=7, blur_size=17, close_size=9):
-    """
-    Apply spatial cleanup and slight expansion so removal masks cover the whole
-    player silhouette more reliably.
+    Apply light spatial cleanup before temporal smoothing.
     """
 
     mask = (mask > 0).astype(np.uint8)
@@ -149,10 +123,9 @@ def stabilize_mask(mask, dilate_size=7, blur_size=17, close_size=9):
     dilate_kernel = np.ones((dilate_size, dilate_size), np.uint8)
     close_kernel = np.ones((close_size, close_size), np.uint8)
 
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel)
     mask = cv2.dilate(mask, dilate_kernel, 1)
     mask = cv2.GaussianBlur(mask.astype(np.float32), (blur_size, blur_size), 0)
-    mask = (mask > 0.2).astype(np.uint8)
+    mask = (mask > 0.25).astype(np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel)
 
     return mask
