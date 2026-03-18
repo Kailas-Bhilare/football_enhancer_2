@@ -15,7 +15,7 @@ from processing.effects import (
 from processing.sd_inpainting import SDInpainter
 
 
-SD_BLEND_ALPHA = 0.2
+SD_BLEND_ALPHA = 0.25
 
 
 def load_selection():
@@ -70,8 +70,8 @@ def main():
     detector = PlayerDetector(YOLO_MODEL_NAME, DETECTION_CLASSES)
     tracker = PlayerTracker()
     sd = SDInpainter()
-    mask_smoother = TemporalMaskSmoother(history=5)
-    composer = TemporalRemovalComposer(blend_alpha=0.35, feather_radius=31)
+    mask_smoother = TemporalMaskSmoother(history=4)
+    composer = TemporalRemovalComposer(blend_alpha=0.3, feather_radius=25)
 
     frame_idx = 0
 
