@@ -136,26 +136,43 @@ def create_player_removal_mask(
     boxes,
     masks,
     selected_indices,
+    auxiliary_masks=None,
+    min_mask_ratio=0.55,
 ):
 
     h, w = frame_shape
 
     combined = np.zeros((h, w), dtype=np.uint8)
 
-    if masks is None or len(masks) == 0:
+    if boxes is None or len(boxes) == 0 or not selected_indices:
         return combined
 
     for idx in selected_indices:
 
-        if idx >= len(masks):
+        if idx >= len(boxes):
             continue
 
-        mask = masks[idx]
+        player_mask = np.zeros((h, w), dtype=np.uint8)
 
-        if mask.shape != (h, w):
-            mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+        for mask_source in (masks, auxiliary_masks):
+            if mask_source is None or idx >= len(mask_source):
+                continue
 
-        combined = np.maximum(combined, mask.astype(np.uint8))
+            mask = mask_source[idx]
+
+            if mask.shape != (h, w):
+                mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+
+            player_mask = np.maximum(player_mask, mask.astype(np.uint8))
+
+        box_mask = mask_from_box(boxes[idx], frame_shape)
+        box_area = np.count_nonzero(box_mask)
+        mask_area = np.count_nonzero(player_mask)
+
+        if box_area > 0 and mask_area < box_area * min_mask_ratio:
+            player_mask = np.maximum(player_mask, box_mask)
+
+        combined = np.maximum(combined, player_mask)
 
     return combined
 

@@ -91,7 +91,7 @@ def main():
 
         frame_idx += 1
 
-        boxes, _ = detector.detect(frame)
+        boxes, detector_masks = detector.detect(frame)
 
         if boxes is None or len(boxes) == 0:
             writer.write(frame)
@@ -105,8 +105,9 @@ def main():
         mask = create_player_removal_mask(
             frame.shape[:2],
             boxes,
-            masks,
-            selected_indices
+            sam_masks,
+            selected_indices,
+            auxiliary_masks=detector_masks,
         )
 
         mask = stabilize_mask(mask)
@@ -119,7 +120,7 @@ def main():
             base_output = cv2.inpaint(
                 frame,
                 mask255,
-                3,
+                5,
                 cv2.INPAINT_TELEA
             )
 
