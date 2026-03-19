@@ -13,14 +13,14 @@ from processing.effects import (
     TemporalRemovalComposer,
     create_player_removal_mask,
     stabilize_mask,
+    feather_mask,
 )
 from processing.sd_inpainting import SDInpainter
 from processing.sam_refiner import SAMRefiner
 
 
-SD_INTERVAL = 12
 MASK_HISTORY = 5
-SD_BLEND_ALPHA = 0.2
+SD_BLEND_ALPHA = 0.85
 
 
 def load_selection():
@@ -45,9 +45,9 @@ def blend_sd_result(base_output, sd_output, mask, alpha=SD_BLEND_ALPHA):
     if sd_output.shape != base_output.shape:
         sd_output = cv2.resize(sd_output, (base_output.shape[1], base_output.shape[0]))
 
-    mask = (mask > 0).astype(np.float32)[..., None]
-    refined = cv2.addWeighted(base_output, 1.0 - alpha, sd_output, alpha, 0)
-    output = base_output.astype(np.float32) * (1.0 - mask) + refined.astype(np.float32) * mask
+    mask_alpha = feather_mask(mask, 31)[..., None] * alpha
+    output = base_output.astype(np.float32) * (1.0 - mask_alpha)
+    output += sd_output.astype(np.float32) * mask_alpha
     return np.clip(output, 0, 255).astype(np.uint8)
 
 
@@ -129,12 +129,10 @@ def main():
                 cv2.INPAINT_TELEA
             )
 
-            output = base_output
-
-            if frame_idx % SD_INTERVAL == 0:
-                sd_output = inpainter.inpaint(base_output, mask)
-                output = blend_sd_result(base_output, sd_output, mask)
-                torch.cuda.empty_cache()
+            reconstructed = reconstructor.reconstruct(frame, mask, base_output)
+            sd_output = inpainter.inpaint(reconstructed, mask)
+            output = blend_sd_result(reconstructed, sd_output, mask)
+            torch.cuda.empty_cache()
 
             output = reconstructor.reconstruct(frame, mask, output)
             output = composer.compose(frame, output, mask)

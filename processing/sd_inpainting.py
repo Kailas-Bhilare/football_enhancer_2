@@ -1,9 +1,11 @@
 """
 Stable Diffusion inpainting module.
 
-Uses fixed seed for consistent results across frames.
+Uses masked ROI inpainting so the generative model focuses detail where players
+were removed instead of re-synthesizing the whole frame.
 """
 
+import cv2
 import torch
 import numpy as np
 from PIL import Image
@@ -12,9 +14,20 @@ from diffusers import StableDiffusionInpaintPipeline
 
 class SDInpainter:
 
-    def __init__(self):
+    def __init__(
+        self,
+        target_size=512,
+        pad_px=48,
+        prompt="empty football pitch grass with field lines, realistic stadium broadcast, no players",
+        negative_prompt="players, person, athlete, blurry, smeared, duplicate lines, distorted field markings",
+    ):
 
         print("Loading Stable Diffusion inpainting...")
+
+        self.target_size = target_size
+        self.pad_px = pad_px
+        self.prompt = prompt
+        self.negative_prompt = negative_prompt
 
         self.pipe = StableDiffusionInpaintPipeline.from_pretrained(
             "runwayml/stable-diffusion-inpainting",
@@ -32,10 +45,40 @@ class SDInpainter:
         # disable progress bar spam
         self.pipe.set_progress_bar_config(disable=True)
 
-        # fixed seed generator (IMPORTANT)
-        self.generator = torch.Generator(device="cuda").manual_seed(42)
-
         print("Stable Diffusion ready")
+
+    def _mask_bbox(self, mask, frame_shape):
+        ys, xs = np.where(mask > 0)
+        if len(xs) == 0 or len(ys) == 0:
+            return None
+
+        h, w = frame_shape[:2]
+        x1 = max(0, int(xs.min()) - self.pad_px)
+        y1 = max(0, int(ys.min()) - self.pad_px)
+        x2 = min(w, int(xs.max()) + self.pad_px + 1)
+        y2 = min(h, int(ys.max()) + self.pad_px + 1)
+
+        box_w = x2 - x1
+        box_h = y2 - y1
+        side = max(box_w, box_h)
+        cx = (x1 + x2) // 2
+        cy = (y1 + y2) // 2
+
+        x1 = max(0, cx - side // 2)
+        y1 = max(0, cy - side // 2)
+        x2 = min(w, x1 + side)
+        y2 = min(h, y1 + side)
+
+        x1 = max(0, x2 - side)
+        y1 = max(0, y2 - side)
+
+        return x1, y1, x2, y2
+
+    def _feather_mask(self, mask, blur_size=21):
+        if blur_size % 2 == 0:
+            blur_size += 1
+        alpha = cv2.GaussianBlur(mask.astype(np.float32), (blur_size, blur_size), 0)
+        return np.clip(alpha, 0.0, 1.0)
 
     def inpaint(self, frame, mask):
         """
@@ -43,25 +86,50 @@ class SDInpainter:
         mask  : binary mask (0/1)
         """
 
-        # BGR → RGB
-        frame_rgb = frame[:, :, ::-1]
+        mask = (mask > 0).astype(np.uint8)
+        bbox = self._mask_bbox(mask, frame.shape)
+        if bbox is None:
+            return frame.copy()
 
-        image = Image.fromarray(frame_rgb)
+        x1, y1, x2, y2 = bbox
+        frame_crop = frame[y1:y2, x1:x2]
+        mask_crop = mask[y1:y2, x1:x2]
 
-        mask_img = Image.fromarray((mask * 255).astype(np.uint8))
+        crop_h, crop_w = frame_crop.shape[:2]
 
+        frame_rgb = cv2.cvtColor(frame_crop, cv2.COLOR_BGR2RGB)
+        frame_resized = cv2.resize(
+            frame_rgb,
+            (self.target_size, self.target_size),
+            interpolation=cv2.INTER_CUBIC,
+        )
+        mask_resized = cv2.resize(
+            mask_crop,
+            (self.target_size, self.target_size),
+            interpolation=cv2.INTER_NEAREST,
+        )
+
+        image = Image.fromarray(frame_resized)
+        mask_img = Image.fromarray((mask_resized * 255).astype(np.uint8))
+
+        generator = torch.Generator(device="cuda").manual_seed(42)
         result = self.pipe(
-            prompt="football field grass stadium",
+            prompt=self.prompt,
+            negative_prompt=self.negative_prompt,
             image=image,
             mask_image=mask_img,
-            generator=self.generator,          # fixed seed
-            guidance_scale=6.5,
-            num_inference_steps=20,
+            generator=generator,
+            guidance_scale=8.0,
+            num_inference_steps=30,
         ).images[0]
 
-        result = np.array(result)
+        result_bgr = cv2.cvtColor(np.array(result), cv2.COLOR_RGB2BGR)
+        result_bgr = cv2.resize(result_bgr, (crop_w, crop_h), interpolation=cv2.INTER_CUBIC)
 
-        # RGB → BGR
-        result = result[:, :, ::-1]
+        alpha = self._feather_mask(mask_crop, blur_size=31)[..., None]
+        blended_crop = frame_crop.astype(np.float32) * (1.0 - alpha)
+        blended_crop += result_bgr.astype(np.float32) * alpha
 
-        return result
+        output = frame.copy()
+        output[y1:y2, x1:x2] = np.clip(blended_crop, 0, 255).astype(np.uint8)
+        return output
