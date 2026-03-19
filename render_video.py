@@ -134,6 +134,7 @@ def main():
             output = blend_sd_result(reconstructed, sd_output, mask)
             torch.cuda.empty_cache()
 
+            output = reconstructor.reconstruct(frame, mask, output)
             output = composer.compose(frame, output, mask)
             reconstructor.update(frame, output, mask)
 

@@ -65,7 +65,6 @@ def main():
     tracker = PlayerTracker()
     sd = SDInpainter()
 
-    # Updated flicker-reduction settings
     mask_smoother = TemporalMaskSmoother(history=5)
     composer = TemporalRemovalComposer(blend_alpha=0.35, feather_radius=31)
     reconstructor = MotionCompensatedBackgroundReconstructor()
@@ -105,6 +104,7 @@ def main():
         if np.sum(mask) > 0:
 
             mask255 = (mask * 255).astype(np.uint8)
+
             base_output = cv2.inpaint(
                 frame,
                 mask255,
@@ -115,6 +115,7 @@ def main():
             reconstructed = reconstructor.reconstruct(frame, mask, base_output)
             sd_output = sd.inpaint(reconstructed, mask)
             output = blend_sd_result(reconstructed, sd_output, mask)
+
             output = composer.compose(frame, output, mask)
             reconstructor.update(frame, output, mask)
 
