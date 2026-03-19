@@ -8,6 +8,7 @@ from config import *
 from models.detector import PlayerDetector
 from processing.tracker import PlayerTracker
 from processing.effects import (
+    MotionCompensatedBackgroundReconstructor,
     TemporalMaskSmoother,
     TemporalRemovalComposer,
     create_player_removal_mask,
@@ -81,6 +82,7 @@ def main():
 
     mask_smoother = TemporalMaskSmoother(history=MASK_HISTORY)
     composer = TemporalRemovalComposer(blend_alpha=0.35, feather_radius=31)
+    reconstructor = MotionCompensatedBackgroundReconstructor()
 
     frame_idx = 0
 
@@ -95,7 +97,9 @@ def main():
         boxes, detector_masks = detector.detect(frame)
 
         if boxes is None or len(boxes) == 0:
-            writer.write(frame)
+            output = frame.copy()
+            reconstructor.update(frame, output, np.zeros(frame.shape[:2], dtype=np.uint8))
+            writer.write(output)
             continue
 
         tracker.update(boxes)
@@ -132,10 +136,13 @@ def main():
                 output = blend_sd_result(base_output, sd_output, mask)
                 torch.cuda.empty_cache()
 
+            output = reconstructor.reconstruct(frame, mask, output)
             output = composer.compose(frame, output, mask)
+            reconstructor.update(frame, output, mask)
 
         else:
             output = frame.copy()
+            reconstructor.update(frame, output, mask)
 
         output = normalize_frame(output, width, height)
         writer.write(output)
