@@ -1,6 +1,8 @@
+import os
+from pathlib import Path
+
 import cv2
 import numpy as np
-import torch
 from segment_anything import sam_model_registry, SamPredictor
 
 
@@ -8,16 +10,54 @@ class SAMRefiner:
 
     def __init__(self, model_type="vit_b", checkpoint="sam_vit_b_01ec64.pth"):
 
+        self.predictor = None
+        self.enabled = False
+        self.model_type = model_type
+        self.checkpoint = self._resolve_checkpoint_path(checkpoint)
+
+        if self.checkpoint is None:
+            print("SAM checkpoint not found; continuing with detector masks only.")
+            return
+
         print("Loading SAM (CPU mode)...")
 
         device = "cpu"   # force CPU to avoid CUDA OOM
 
-        sam = sam_model_registry[model_type](checkpoint=checkpoint)
-        sam.to(device)
+        try:
+            sam = sam_model_registry[model_type](checkpoint=self.checkpoint)
+            sam.to(device)
+            self.predictor = SamPredictor(sam)
+            self.enabled = True
+            print(f"SAM ready (CPU, optimized) from {self.checkpoint}")
+        except FileNotFoundError:
+            print("SAM checkpoint disappeared during load; continuing with detector masks only.")
+        except Exception as exc:
+            print(f"SAM unavailable ({exc}); continuing with detector masks only.")
 
-        self.predictor = SamPredictor(sam)
+    def _resolve_checkpoint_path(self, checkpoint):
+        candidates = []
 
-        print("SAM ready (CPU, optimized)")
+        if checkpoint:
+            candidates.append(Path(checkpoint))
+
+        env_checkpoint = os.environ.get("SAM_CHECKPOINT")
+        if env_checkpoint:
+            candidates.append(Path(env_checkpoint))
+
+        if checkpoint:
+            candidates.extend([
+                Path(__file__).resolve().parent.parent / checkpoint,
+                Path.cwd() / checkpoint,
+                Path.home() / checkpoint,
+                Path.home() / ".cache" / "sam" / checkpoint,
+                Path.home() / "checkpoints" / checkpoint,
+            ])
+
+        for candidate in candidates:
+            if candidate.exists() and candidate.is_file():
+                return str(candidate)
+
+        return None
 
     def refine(self, frame, boxes):
         """
@@ -25,6 +65,9 @@ class SAMRefiner:
         boxes: [N,4]
         returns: masks [N, H, W]
         """
+
+        if not self.enabled or self.predictor is None:
+            return None
 
         if boxes is None or len(boxes) == 0:
             return None
