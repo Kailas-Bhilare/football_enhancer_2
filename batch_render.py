@@ -7,6 +7,7 @@ from config import *
 from models.detector import PlayerDetector
 from processing.tracker import PlayerTracker
 from processing.effects import (
+    MotionCompensatedBackgroundReconstructor,
     TemporalMaskSmoother,
     TemporalRemovalComposer,
     create_player_removal_mask,
@@ -74,6 +75,7 @@ def main():
     # Updated flicker-reduction settings
     mask_smoother = TemporalMaskSmoother(history=5)
     composer = TemporalRemovalComposer(blend_alpha=0.35, feather_radius=31)
+    reconstructor = MotionCompensatedBackgroundReconstructor()
 
     frame_idx = 0
 
@@ -88,7 +90,9 @@ def main():
         boxes, detector_masks = detector.detect(frame)
 
         if boxes is None or len(boxes) == 0:
-            writer.write(frame)
+            output = frame.copy()
+            reconstructor.update(frame, output, np.zeros(frame.shape[:2], dtype=np.uint8))
+            writer.write(output)
             continue
 
         tracker.update(boxes)
@@ -111,10 +115,13 @@ def main():
             output_small = sd.inpaint(small_frame, small_mask)
             output = upscale_back(output_small, orig_size)
             output = blend_sd_result(frame, output, mask)
+            output = reconstructor.reconstruct(frame, mask, output)
             output = composer.compose(frame, output, mask)
+            reconstructor.update(frame, output, mask)
 
         else:
             output = frame.copy()
+            reconstructor.update(frame, output, mask)
 
         writer.write(output.astype(np.uint8))
 
