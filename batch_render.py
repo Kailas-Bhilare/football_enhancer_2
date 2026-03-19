@@ -12,11 +12,12 @@ from processing.effects import (
     TemporalRemovalComposer,
     create_player_removal_mask,
     stabilize_mask,
+    feather_mask,
 )
 from processing.sd_inpainting import SDInpainter
 
 
-SD_BLEND_ALPHA = 0.2
+SD_BLEND_ALPHA = 0.85
 
 
 def load_selection():
@@ -24,24 +25,16 @@ def load_selection():
         return set(json.load(f)["selected_ids"])
 
 
-def resize_for_sd(frame, mask, size=256):
-
-    h, w = frame.shape[:2]
-
-    frame_small = cv2.resize(frame, (size, size))
-    mask_small = cv2.resize(mask, (size, size))
-
-    return frame_small, mask_small, (w, h)
-
-
-def upscale_back(frame_small, orig_size):
-    return cv2.resize(frame_small, orig_size)
-
-
 def blend_sd_result(base_output, sd_output, mask, alpha=SD_BLEND_ALPHA):
-    mask = (mask > 0).astype(np.float32)[..., None]
-    refined = cv2.addWeighted(base_output, 1.0 - alpha, sd_output, alpha, 0)
-    output = base_output.astype(np.float32) * (1.0 - mask) + refined.astype(np.float32) * mask
+    if sd_output is None:
+        return base_output
+
+    if sd_output.shape != base_output.shape:
+        sd_output = cv2.resize(sd_output, (base_output.shape[1], base_output.shape[0]))
+
+    mask_alpha = feather_mask(mask, 31)[..., None] * alpha
+    output = base_output.astype(np.float32) * (1.0 - mask_alpha)
+    output += sd_output.astype(np.float32) * mask_alpha
     return np.clip(output, 0, 255).astype(np.uint8)
 
 
@@ -72,7 +65,6 @@ def main():
     tracker = PlayerTracker()
     sd = SDInpainter()
 
-    # Updated flicker-reduction settings
     mask_smoother = TemporalMaskSmoother(history=5)
     composer = TemporalRemovalComposer(blend_alpha=0.35, feather_radius=31)
     reconstructor = MotionCompensatedBackgroundReconstructor()
@@ -111,11 +103,19 @@ def main():
 
         if np.sum(mask) > 0:
 
-            small_frame, small_mask, orig_size = resize_for_sd(frame, mask)
-            output_small = sd.inpaint(small_frame, small_mask)
-            output = upscale_back(output_small, orig_size)
-            output = blend_sd_result(frame, output, mask)
-            output = reconstructor.reconstruct(frame, mask, output)
+            mask255 = (mask * 255).astype(np.uint8)
+
+            base_output = cv2.inpaint(
+                frame,
+                mask255,
+                5,
+                cv2.INPAINT_TELEA
+            )
+
+            reconstructed = reconstructor.reconstruct(frame, mask, base_output)
+            sd_output = sd.inpaint(reconstructed, mask)
+            output = blend_sd_result(reconstructed, sd_output, mask)
+
             output = composer.compose(frame, output, mask)
             reconstructor.update(frame, output, mask)
 
