@@ -132,7 +132,8 @@ def main():
             reconstructed = reconstructor.reconstruct(frame, mask, base_output)
             sd_output = inpainter.inpaint(reconstructed, mask)
             output = blend_sd_result(reconstructed, sd_output, mask)
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             output = reconstructor.reconstruct(frame, mask, output)
             output = composer.compose(frame, output, mask)
