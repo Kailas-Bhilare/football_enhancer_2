@@ -306,6 +306,61 @@ def mask_from_box(box, frame_shape, pad_ratio=0.08, pad_px=6):
     return support
 
 
+def keep_largest_component(mask):
+    """
+    Keep only the dominant connected component to avoid stray mask fragments.
+    """
+
+    mask = (mask > 0).astype(np.uint8)
+
+    if np.count_nonzero(mask) == 0:
+        return mask
+
+    component_count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+
+    if component_count <= 1:
+        return mask
+
+    largest_idx = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+    return (labels == largest_idx).astype(np.uint8)
+
+
+def expand_mask_with_support(
+    mask,
+    support_mask,
+    dilate_size=5,
+    iterations=2,
+    blur_size=11,
+):
+    """
+    Grow an existing silhouette toward a conservative bbox support region
+    without falling back to the full box immediately.
+    """
+
+    mask = (mask > 0).astype(np.uint8)
+    support_mask = (support_mask > 0).astype(np.uint8)
+
+    if np.count_nonzero(mask) == 0:
+        return support_mask
+
+    kernel = np.ones((dilate_size, dilate_size), np.uint8)
+    expanded = mask.copy()
+
+    for _ in range(iterations):
+        expanded = cv2.dilate(expanded, kernel, 1)
+        expanded = cv2.bitwise_and(expanded, support_mask)
+
+    expanded = cv2.bitwise_or(expanded, mask)
+
+    if blur_size > 1:
+        if blur_size % 2 == 0:
+            blur_size += 1
+        expanded = cv2.GaussianBlur(expanded.astype(np.float32), (blur_size, blur_size), 0)
+        expanded = (expanded > 0.2).astype(np.uint8)
+
+    return cv2.bitwise_and(expanded, support_mask)
+
+
 def stabilize_mask(mask, dilate_size=7, blur_size=17, close_size=9):
     """
     Apply spatial cleanup and slight expansion so removal masks cover the whole
@@ -315,13 +370,17 @@ def stabilize_mask(mask, dilate_size=7, blur_size=17, close_size=9):
     mask = (mask > 0).astype(np.uint8)
 
     dilate_kernel = np.ones((dilate_size, dilate_size), np.uint8)
+    open_kernel = np.ones((max(3, close_size - 2), max(3, close_size - 2)), np.uint8)
     close_kernel = np.ones((close_size, close_size), np.uint8)
 
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel)
+    mask = keep_largest_component(mask)
     mask = cv2.dilate(mask, dilate_kernel, 1)
     mask = cv2.GaussianBlur(mask.astype(np.float32), (blur_size, blur_size), 0)
     mask = (mask > 0.2).astype(np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel)
+    mask = keep_largest_component(mask)
 
     return mask
 
@@ -333,6 +392,7 @@ def create_player_removal_mask(
     selected_indices,
     auxiliary_masks=None,
     min_mask_ratio=0.55,
+    fallback_ratio=0.18,
 ):
 
     h, w = frame_shape
@@ -364,8 +424,16 @@ def create_player_removal_mask(
         box_area = np.count_nonzero(box_mask)
         mask_area = np.count_nonzero(player_mask)
 
+        if mask_area > 0:
+            player_mask = keep_largest_component(player_mask)
+
         if box_area > 0 and mask_area < box_area * min_mask_ratio:
-            player_mask = np.maximum(player_mask, box_mask)
+            if mask_area <= box_area * fallback_ratio:
+                player_mask = np.maximum(player_mask, box_mask)
+            else:
+                player_mask = expand_mask_with_support(player_mask, box_mask)
+
+        player_mask = stabilize_mask(player_mask)
 
         combined = np.maximum(combined, player_mask)
 
