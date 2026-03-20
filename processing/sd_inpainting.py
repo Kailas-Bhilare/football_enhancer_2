@@ -9,7 +9,6 @@ import cv2
 import torch
 import numpy as np
 from PIL import Image
-from diffusers import StableDiffusionInpaintPipeline
 
 
 class SDInpainter:
@@ -22,30 +21,50 @@ class SDInpainter:
         negative_prompt="players, person, athlete, blurry, smeared, duplicate lines, distorted field markings",
     ):
 
-        print("Loading Stable Diffusion inpainting...")
-
         self.target_size = target_size
         self.pad_px = pad_px
         self.prompt = prompt
         self.negative_prompt = negative_prompt
+        self.pipe = None
+        self.enabled = False
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        self.pipe = StableDiffusionInpaintPipeline.from_pretrained(
-            "runwayml/stable-diffusion-inpainting",
-            torch_dtype=torch.float16,
-        )
+        if self.device != "cuda":
+            print("Stable Diffusion inpainting disabled: CUDA is not available.")
+            return
 
-        self.pipe = self.pipe.to("cuda")
+        try:
+            from diffusers import StableDiffusionInpaintPipeline
+        except ModuleNotFoundError:
+            print("diffusers is not installed; disabling Stable Diffusion inpainting.")
+            return
+        except Exception as exc:
+            print(f"Stable Diffusion import failed ({exc}); disabling inpainting.")
+            return
 
-        # memory optimization
-        self.pipe.enable_xformers_memory_efficient_attention()
+        print("Loading Stable Diffusion inpainting...")
 
-        # disable safety checker (faster)
-        self.pipe.safety_checker = None
+        try:
+            self.pipe = StableDiffusionInpaintPipeline.from_pretrained(
+                "runwayml/stable-diffusion-inpainting",
+                torch_dtype=torch.float16,
+            )
 
-        # disable progress bar spam
-        self.pipe.set_progress_bar_config(disable=True)
+            self.pipe = self.pipe.to(self.device)
 
-        print("Stable Diffusion ready")
+            if hasattr(self.pipe, "enable_xformers_memory_efficient_attention"):
+                try:
+                    self.pipe.enable_xformers_memory_efficient_attention()
+                except Exception as exc:
+                    print(f"xFormers attention unavailable ({exc}); continuing without it.")
+
+            self.pipe.safety_checker = None
+            self.pipe.set_progress_bar_config(disable=True)
+            self.enabled = True
+            print("Stable Diffusion ready")
+        except Exception as exc:
+            self.pipe = None
+            print(f"Stable Diffusion unavailable ({exc}); disabling inpainting.")
 
     def _mask_bbox(self, mask, frame_shape):
         ys, xs = np.where(mask > 0)
@@ -86,6 +105,9 @@ class SDInpainter:
         mask  : binary mask (0/1)
         """
 
+        if not self.enabled or self.pipe is None:
+            return None
+
         mask = (mask > 0).astype(np.uint8)
         bbox = self._mask_bbox(mask, frame.shape)
         if bbox is None:
@@ -112,7 +134,7 @@ class SDInpainter:
         image = Image.fromarray(frame_resized)
         mask_img = Image.fromarray((mask_resized * 255).astype(np.uint8))
 
-        generator = torch.Generator(device="cuda").manual_seed(42)
+        generator = torch.Generator(device=self.device).manual_seed(42)
         result = self.pipe(
             prompt=self.prompt,
             negative_prompt=self.negative_prompt,
