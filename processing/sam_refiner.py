@@ -3,7 +3,6 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from segment_anything import sam_model_registry, SamPredictor
 
 
 class SAMRefiner:
@@ -14,6 +13,15 @@ class SAMRefiner:
         self.enabled = False
         self.model_type = model_type
         self.checkpoint = self._resolve_checkpoint_path(checkpoint)
+
+        try:
+            from segment_anything import SamPredictor, sam_model_registry
+        except ModuleNotFoundError:
+            print("segment_anything is not installed; continuing with detector masks only.")
+            return
+        except Exception as exc:
+            print(f"SAM import failed ({exc}); continuing with detector masks only.")
+            return
 
         if self.checkpoint is None:
             print("SAM checkpoint not found; continuing with detector masks only.")
@@ -76,12 +84,12 @@ class SAMRefiner:
 
         # --- resize for efficiency ---
         max_dim = 512
-        scale = max_dim / max(orig_h, orig_w)
+        scale = min(1.0, max_dim / max(orig_h, orig_w))
 
-        new_w = int(orig_w * scale)
-        new_h = int(orig_h * scale)
+        new_w = max(1, int(orig_w * scale))
+        new_h = max(1, int(orig_h * scale))
 
-        frame_small = cv2.resize(frame, (new_w, new_h))
+        frame_small = cv2.resize(frame, (new_w, new_h)) if scale != 1.0 else frame
 
         # SAM expects RGB
         frame_small_rgb = frame_small[:, :, ::-1]
@@ -114,7 +122,7 @@ class SAMRefiner:
                 mask_small,
                 (orig_w, orig_h),
                 interpolation=cv2.INTER_NEAREST
-            )
+            ) if scale != 1.0 else mask_small
 
             masks.append(mask_full)
 
