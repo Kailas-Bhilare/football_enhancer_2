@@ -6,23 +6,96 @@ import numpy as np
 # Mask utilities
 # -----------------------------
 
+
 def feather_mask(mask, ksize=21):
     mask = mask.astype(np.float32)
     return cv2.GaussianBlur(mask, (ksize, ksize), 0)
 
 
+def _odd(value):
+    value = max(1, int(value))
+    return value if value % 2 == 1 else value + 1
+
+
+def _span_fill(mask):
+    """
+    Fill gaps between positive pixels along rows and columns.
+    This helps reconnect fragmented body parts inside a player silhouette.
+    """
+
+    filled = mask.copy().astype(np.uint8)
+
+    if filled.ndim != 2 or np.count_nonzero(filled) == 0:
+        return filled
+
+    row_hits = np.where(filled.any(axis=1))[0]
+    for row in row_hits:
+        cols = np.where(filled[row] > 0)[0]
+        if cols.size >= 2:
+            filled[row, cols[0]:cols[-1] + 1] = 1
+
+    col_hits = np.where(filled.any(axis=0))[0]
+    for col in col_hits:
+        rows = np.where(filled[:, col] > 0)[0]
+        if rows.size >= 2:
+            filled[rows[0]:rows[-1] + 1, col] = 1
+
+    return filled
+
+
+def refine_player_mask(mask, bbox=None, frame_shape=None):
+    """
+    Make a single-player mask less choppy by reconnecting fragmented regions
+    and softly padding the result inside the player's bounding box.
+    """
+
+    refined = (mask > 0).astype(np.uint8)
+
+    if refined.ndim != 2 or np.count_nonzero(refined) == 0:
+        return refined
+
+    if bbox is not None and frame_shape is not None:
+        frame_h, frame_w = frame_shape
+        x1, y1, x2, y2 = map(int, bbox)
+        pad_x = max(6, int((x2 - x1) * 0.1))
+        pad_y = max(6, int((y2 - y1) * 0.08))
+        x1 = max(0, x1 - pad_x)
+        y1 = max(0, y1 - pad_y)
+        x2 = min(frame_w, x2 + pad_x)
+        y2 = min(frame_h, y2 + pad_y)
+        roi = refined[y1:y2, x1:x2]
+        roi = _span_fill(roi)
+        refined[y1:y2, x1:x2] = roi
+    else:
+        refined = _span_fill(refined)
+
+    if hasattr(cv2, "morphologyEx") and hasattr(cv2, "getStructuringElement"):
+        kernel_w = _odd(max(3, refined.shape[1] // 80))
+        kernel_h = _odd(max(3, refined.shape[0] // 80))
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_w, kernel_h))
+        refined = cv2.morphologyEx(refined, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    return (refined > 0).astype(np.uint8)
+
+
 def stabilize_mask(mask):
     mask = (mask > 0).astype(np.uint8)
+    mask = _span_fill(mask)
 
-    # stronger expansion (this is what you want)
+    if hasattr(cv2, "morphologyEx") and hasattr(cv2, "getStructuringElement"):
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel, iterations=1)
+
+    # stronger expansion to cover partial misses around limbs and edges
     mask = cv2.dilate(mask, np.ones((7, 7), np.uint8), 2)
 
-    return mask
+    return (mask > 0).astype(np.uint8)
 
 
 # -----------------------------
 # Mask creation
 # -----------------------------
+
 
 def create_player_removal_mask(
     frame_shape,
@@ -47,11 +120,13 @@ def create_player_removal_mask(
             if m is not None:
                 player_mask = np.maximum(player_mask, (m > 0.5).astype(np.uint8))
 
-        # detector fallback
+        # detector fallback / complement
         if auxiliary_masks is not None and i < len(auxiliary_masks):
             dm = auxiliary_masks[i]
             if dm is not None:
                 player_mask = np.maximum(player_mask, (dm > 0.4).astype(np.uint8))
+
+        player_mask = refine_player_mask(player_mask, bbox=(x1, y1, x2, y2), frame_shape=frame_shape)
 
         # HARD bbox fallback (only if mask weak)
         if np.sum(player_mask) < 50:
@@ -72,12 +147,14 @@ def create_player_removal_mask(
 # Temporal smoothing
 # -----------------------------
 
+
 class TemporalMaskSmoother:
     def __init__(self, history=5):
         self.history = []
         self.max_len = history
 
     def smooth(self, mask):
+        mask = (mask > 0).astype(np.uint8)
         self.history.append(mask)
 
         if len(self.history) > self.max_len:
@@ -92,12 +169,18 @@ class TemporalMaskSmoother:
         if combined.max() > 0:
             combined /= combined.max()
 
-        return (combined > 0.4).astype(np.uint8)
+        recent_union = np.maximum.reduce(self.history[-min(3, len(self.history)):])
+        stable = (combined > 0.45).astype(np.uint8)
+        recovered = (combined > 0.2).astype(np.uint8) * recent_union
+        smoothed = np.maximum(stable, recovered).astype(np.uint8)
+
+        return refine_player_mask(smoothed)
 
 
 # -----------------------------
 # Frame composer
 # -----------------------------
+
 
 class TemporalRemovalComposer:
     def __init__(self, blend_alpha=0.15, feather_radius=21):
@@ -127,6 +210,7 @@ class TemporalRemovalComposer:
 # -----------------------------
 # Background reconstruction
 # -----------------------------
+
 
 class MotionCompensatedBackgroundReconstructor:
 
@@ -169,6 +253,7 @@ class MotionCompensatedBackgroundReconstructor:
 # -----------------------------
 # Debug / UI helper
 # -----------------------------
+
 
 def draw_selected_players(frame, boxes, selected_indices, id_mapping=None):
 
