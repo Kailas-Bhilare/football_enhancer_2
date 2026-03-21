@@ -8,6 +8,10 @@ sys.modules.setdefault(
     types.SimpleNamespace(
         GaussianBlur=lambda image, kernel, sigma: image,
         dilate=lambda image, kernel, iterations=1: image,
+        morphologyEx=lambda image, op, kernel, iterations=1: image,
+        getStructuringElement=lambda shape, ksize: np.ones(ksize, dtype=np.uint8),
+        MORPH_CLOSE=0,
+        MORPH_ELLIPSE=0,
         rectangle=lambda *args, **kwargs: None,
         putText=lambda *args, **kwargs: None,
         FONT_HERSHEY_SIMPLEX=0,
@@ -15,7 +19,13 @@ sys.modules.setdefault(
     ),
 )
 
-from processing.effects import MotionCompensatedBackgroundReconstructor, TemporalRemovalComposer
+from processing.effects import (
+    MotionCompensatedBackgroundReconstructor,
+    TemporalMaskSmoother,
+    TemporalRemovalComposer,
+    create_player_removal_mask,
+    refine_player_mask,
+)
 from processing.tracker import PlayerTracker
 
 
@@ -70,3 +80,51 @@ def test_temporal_composer_keeps_masked_region_bright():
 
     expected = np.full((2, 2, 3), 120, dtype=np.uint8)
     np.testing.assert_array_equal(blended, expected)
+
+
+def test_refine_player_mask_fills_internal_gaps():
+    mask = np.zeros((7, 7), dtype=np.uint8)
+    mask[1:6, 2] = 1
+    mask[1:6, 4] = 1
+    mask[2, 1:6] = 1
+    mask[4, 1:6] = 1
+
+    refined = refine_player_mask(mask, bbox=(1, 1, 5, 5), frame_shape=mask.shape)
+
+    assert refined[3, 3] == 1
+
+
+def test_create_player_removal_mask_merges_fragmented_masks():
+    boxes = np.array([[1, 1, 7, 7]], dtype=np.float32)
+    sam_masks = np.zeros((1, 9, 9), dtype=np.uint8)
+    detector_masks = np.zeros((1, 9, 9), dtype=np.uint8)
+
+    sam_masks[0, 2:7, 3] = 1
+    sam_masks[0, 2:7, 5] = 1
+    detector_masks[0, 3, 2:7] = 1
+    detector_masks[0, 5, 2:7] = 1
+
+    merged = create_player_removal_mask(
+        (9, 9),
+        boxes,
+        sam_masks,
+        selected_indices={0},
+        auxiliary_masks=detector_masks,
+    )
+
+    assert merged[4, 4] == 1
+
+
+def test_temporal_mask_smoother_keeps_recent_partial_mask_regions():
+    smoother = TemporalMaskSmoother(history=3)
+
+    full_mask = np.zeros((6, 6), dtype=np.uint8)
+    full_mask[1:5, 1:5] = 1
+    partial_mask = full_mask.copy()
+    partial_mask[2:4, 2:4] = 0
+
+    smoother.smooth(full_mask)
+    stabilized = smoother.smooth(partial_mask)
+
+    assert stabilized[2, 2] == 1
+    assert stabilized[3, 3] == 1
