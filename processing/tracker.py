@@ -44,6 +44,7 @@ class PlayerTracker:
         detections = list(detections)
 
         if len(detections) == 0:
+            self.id_mapping = {}
 
             remove_ids = []
 
@@ -112,13 +113,15 @@ class PlayerTracker:
         for di, box in enumerate(detections):
 
             if di not in used_dets:
+                pid = self.next_id
 
-                self.tracked_players[self.next_id] = {
+                self.tracked_players[pid] = {
                     "bbox": box,
                     "lost": 0,
                 }
 
-                self.id_mapping[di] = self.next_id
+                self.id_mapping[di] = pid
+                matched_tracks.add(pid)
                 self.next_id += 1
 
         remove_ids = []
