@@ -181,6 +181,9 @@ def main():
                 tracker,
                 state.selected_ids
             )
+        else:
+            tracker.update([])
+            state.current_boxes = []
 
         cv2.imshow(WINDOW_NAME, frame)
 
