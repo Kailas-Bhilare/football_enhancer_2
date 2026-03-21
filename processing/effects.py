@@ -112,10 +112,11 @@ class TemporalRemovalComposer:
             return output
 
         mask_f = feather_mask(mask, self.feather)[..., None]
+        temporal_alpha = np.clip(mask_f * self.alpha, 0.0, 1.0)
 
         blended = (
-            output.astype(np.float32) * (1 - mask_f)
-            + self.prev_output.astype(np.float32) * mask_f * self.alpha
+            output.astype(np.float32) * (1 - temporal_alpha)
+            + self.prev_output.astype(np.float32) * temporal_alpha
         )
 
         self.prev_output = blended.astype(np.uint8)
