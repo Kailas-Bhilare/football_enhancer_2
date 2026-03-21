@@ -185,9 +185,11 @@ def main():
                     output = reconstructed
 
                 output = composer.compose(frame, output, mask)
+                reconstructor.update(frame, output, mask)
 
             else:
                 output = frame.copy()
+                reconstructor.update(frame, output, mask)
 
         output = normalize_frame(output, width, height)
 

@@ -15,7 +15,7 @@ sys.modules.setdefault(
     ),
 )
 
-from processing.effects import MotionCompensatedBackgroundReconstructor
+from processing.effects import MotionCompensatedBackgroundReconstructor, TemporalRemovalComposer
 from processing.tracker import PlayerTracker
 
 
@@ -55,3 +55,18 @@ def test_reconstructor_update_preserves_clean_background():
     assert reconstructor.background is not None
     np.testing.assert_array_equal(reconstructor.background[0, 0], frame[0, 0])
     np.testing.assert_array_equal(reconstructor.background[1, 1], output[1, 1])
+
+
+def test_temporal_composer_keeps_masked_region_bright():
+    composer = TemporalRemovalComposer(blend_alpha=0.2, feather_radius=3)
+
+    frame = np.zeros((2, 2, 3), dtype=np.uint8)
+    first_output = np.full((2, 2, 3), 200, dtype=np.uint8)
+    second_output = np.full((2, 2, 3), 100, dtype=np.uint8)
+    mask = np.ones((2, 2), dtype=np.uint8)
+
+    composer.compose(frame, first_output, mask)
+    blended = composer.compose(frame, second_output, mask)
+
+    expected = np.full((2, 2, 3), 120, dtype=np.uint8)
+    np.testing.assert_array_equal(blended, expected)
