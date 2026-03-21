@@ -1,6 +1,7 @@
 import cv2
 import json
 import argparse
+from pathlib import Path
 import numpy as np
 import torch
 
@@ -24,7 +25,13 @@ SD_BLEND_ALPHA = 0.45
 
 
 def load_selection():
-    with open("selection.json", "r") as f:
+    selection_path = Path("selection.json")
+    if not selection_path.exists():
+        raise FileNotFoundError(
+            "selection.json not found. Run the selection step first or provide the file."
+        )
+
+    with selection_path.open("r") as f:
         return set(json.load(f)["selected_ids"])
 
 
@@ -62,11 +69,15 @@ def main():
     print("Players selected:", selected_ids)
 
     cap = cv2.VideoCapture(args.input)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open input video: {args.input}")
 
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 0
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if fps <= 0:
+        fps = 30.0
 
     writer = cv2.VideoWriter(
         args.output,
@@ -74,6 +85,9 @@ def main():
         fps,
         (width, height)
     )
+    if not writer.isOpened():
+        cap.release()
+        raise RuntimeError(f"Cannot create output video: {args.output}")
 
     detector = PlayerDetector(YOLO_MODEL_NAME, DETECTION_CLASSES)
     tracker = PlayerTracker()
@@ -98,6 +112,7 @@ def main():
 
         if boxes is None or len(boxes) == 0:
             writer.write(frame)
+            reconstructor.update(frame, frame, np.zeros(frame.shape[:2], dtype=np.uint8))
             continue
 
         tracker.update(boxes)

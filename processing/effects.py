@@ -154,7 +154,15 @@ class MotionCompensatedBackgroundReconstructor:
         return result
 
     def update(self, frame, output, mask):
-        pass
+        if self.background is None:
+            self.background = output.copy()
+            return
+
+        safe_output = output.copy()
+        if mask is not None:
+            safe_output[mask == 0] = frame[mask == 0]
+
+        self.background = safe_output
 
 
 # -----------------------------
