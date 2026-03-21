@@ -100,6 +100,7 @@ def main():
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 0
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
     if fps <= 0:
         fps = 30.0
     if total <= 0:
@@ -150,7 +151,6 @@ def main():
             tracker.update(boxes)
 
             sam_masks = sam.refine(frame, boxes)
-
             selected_indices = tracker.get_detection_indices(selected_ids)
 
             mask = create_player_removal_mask(
@@ -161,39 +161,29 @@ def main():
                 auxiliary_masks=detector_masks,
             )
 
-            # 🔥 bigger + stable mask
             mask = stabilize_mask(mask)
             mask = mask_smoother.smooth(mask)
 
             if np.sum(mask) > 0:
 
-                # clean mask (no blur artifacts)
                 mask_clean = cv2.medianBlur((mask * 255).astype(np.uint8), 5)
                 mask255 = (mask_clean > 127).astype(np.uint8) * 255
 
-                # base inpainting
                 base = cv2.inpaint(frame, mask255, 4, cv2.INPAINT_TELEA)
-
-                # reconstruction
                 reconstructed = reconstructor.reconstruct(frame, mask, base)
 
-                # 🔥 BLACK PATCH FIX
                 if np.mean(reconstructed[mask > 0]) < 10:
                     reconstructed = base
 
-                # 🔥 controlled SD usage
                 if frame_idx % 15 == 0 and np.sum(mask) > 500:
-
                     sd_output = sd.inpaint(reconstructed, mask)
                     output = blend_sd_result(reconstructed, sd_output, mask)
 
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
-
                 else:
                     output = reconstructed
 
-                # temporal stabilization
                 output = composer.compose(frame, output, mask)
 
             else:
