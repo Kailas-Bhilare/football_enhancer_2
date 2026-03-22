@@ -178,7 +178,8 @@ class SDInpainter:
                                    interpolation=cv2.INTER_NEAREST)
 
         image    = Image.fromarray(frame_resized)
-        mask_img = Image.fromarray((mask_resized * 255).astype(np.uint8))
+        mask_soft = cv2.GaussianBlur(mask_resized.astype(np.float32), (15, 15), 0)
+        mask_img = Image.fromarray((mask_soft * 255).astype(np.uint8))
 
         # Seed strategy: position-derived for spatial consistency,
         # or fully random (None) if seed_from_position=False.
