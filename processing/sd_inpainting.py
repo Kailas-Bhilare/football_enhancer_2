@@ -185,7 +185,7 @@ class SDInpainter:
         # or fully random (None) if seed_from_position=False.
         seed = self._make_seed(mask_crop)
         if seed is not None:
-            generator = torch.Generator(device=self.device).manual_seed(seed)
+            generator = torch.Generator().manual_seed(seed)
         else:
             generator = None
 
