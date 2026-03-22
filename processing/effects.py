@@ -1,29 +1,62 @@
+"""
+processing/effects.py
+
+Background reconstruction and mask utilities for player removal.
+
+Architecture
+------------
+MotionCompensatedBackgroundReconstructor maintains a rolling buffer of raw
+(unprocessed) frames alongside their player-occlusion masks.  On each frame:
+
+  1. Every buffered frame is aligned to the current camera pose via sparse
+     Lucas-Kanade optical flow + RANSAC homography (8-DOF, handles pan/tilt/zoom).
+  2. Occluded pixels in each buffered frame are excluded from contributing.
+  3. Valid pixels are blended with exponential time-decay weights so that
+     the most recent clean observation wins.
+  4. Pixels for which no buffered frame has usable data fall back to
+     OpenCV TELEA inpainting as the last resort.
+  5. When Stable Diffusion produces a clean inpainted region, that result is
+     re-inserted into the buffer as a "virtual background frame" (mask=zeros).
+     Future frames then receive it through the same homography-alignment path,
+     so SD results are automatically camera-corrected without a separate cache.
+
+Key design decisions
+--------------------
+* Raw frames (not outputs) are stored — inpainting artefacts never feed back.
+* Homography instead of affine — models zoom correctly.
+* Explicit per-pixel validity maps — black warp-border pixels are never used.
+* Color-sampled boundary fill before TELEA — reduces smear on large holes.
+* TemporalRemovalComposer alpha reduced to 0.15 — avoids ghost trails.
+* stabilize_mask dilation reduced to (5,5)×1 — preserves surrounding context.
+"""
+
 import cv2
 import numpy as np
 from collections import deque
 
 
-# -----------------------------
+# ---------------------------------------------------------------------------
 # Mask utilities
-# -----------------------------
+# ---------------------------------------------------------------------------
 
 
-def feather_mask(mask, ksize=21):
-    mask = mask.astype(np.float32)
+def feather_mask(mask: np.ndarray, ksize: int = 21) -> np.ndarray:
+    """Gaussian-blur a binary mask to produce a soft alpha channel."""
     if ksize % 2 == 0:
         ksize += 1
-    return cv2.GaussianBlur(mask, (ksize, ksize), 0)
+    return cv2.GaussianBlur(mask.astype(np.float32), (ksize, ksize), 0)
 
 
-def _odd(value):
+def _odd(value: int) -> int:
     value = max(1, int(value))
     return value if value % 2 == 1 else value + 1
 
 
-def _span_fill(mask):
+def _span_fill(mask: np.ndarray) -> np.ndarray:
     """
-    Fill gaps between positive pixels along rows and columns.
-    Reconnects fragmented body parts inside a player silhouette.
+    Fill horizontal and vertical gaps between foreground pixels.
+    Reconnects fragmented limbs inside a player silhouette so the removal
+    mask does not have holes that let player pixels bleed through.
     """
     filled = mask.copy().astype(np.uint8)
     if filled.ndim != 2 or np.count_nonzero(filled) == 0:
@@ -44,10 +77,13 @@ def _span_fill(mask):
     return filled
 
 
-def refine_player_mask(mask, bbox=None, frame_shape=None):
+def refine_player_mask(
+    mask: np.ndarray,
+    bbox: tuple = None,
+    frame_shape: tuple = None,
+) -> np.ndarray:
     """
-    Make a single-player mask less choppy by reconnecting fragmented regions
-    and softly padding the result inside the player's bounding box.
+    Close internal mask gaps and lightly pad within the player bounding box.
     """
     refined = (mask > 0).astype(np.uint8)
     if refined.ndim != 2 or np.count_nonzero(refined) == 0:
@@ -56,7 +92,7 @@ def refine_player_mask(mask, bbox=None, frame_shape=None):
     if bbox is not None and frame_shape is not None:
         frame_h, frame_w = frame_shape
         x1, y1, x2, y2 = map(int, bbox)
-        pad_x = max(6, int((x2 - x1) * 0.1))
+        pad_x = max(6, int((x2 - x1) * 0.10))
         pad_y = max(6, int((y2 - y1) * 0.08))
         x1 = max(0, x1 - pad_x)
         y1 = max(0, y1 - pad_y)
@@ -68,49 +104,51 @@ def refine_player_mask(mask, bbox=None, frame_shape=None):
     else:
         refined = _span_fill(refined)
 
-    if hasattr(cv2, "morphologyEx") and hasattr(cv2, "getStructuringElement"):
-        kernel_w = _odd(max(3, refined.shape[1] // 80))
-        kernel_h = _odd(max(3, refined.shape[0] // 80))
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_w, kernel_h))
-        refined = cv2.morphologyEx(refined, cv2.MORPH_CLOSE, kernel, iterations=1)
+    kernel_w = _odd(max(3, refined.shape[1] // 80))
+    kernel_h = _odd(max(3, refined.shape[0] // 80))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_w, kernel_h))
+    refined = cv2.morphologyEx(refined, cv2.MORPH_CLOSE, kernel, iterations=1)
 
     return (refined > 0).astype(np.uint8)
 
 
-def stabilize_mask(mask):
+def stabilize_mask(mask: np.ndarray) -> np.ndarray:
     """
-    Close internal gaps and expand slightly to cover partial misses.
+    Close internal gaps and expand slightly to cover segmentation edge noise.
 
-    BUG FIX: reduced dilation from (7,7)×2 to (5,5)×1.
-    Over-aggressive dilation erased valid background pixels near players,
-    giving the inpainter a larger hole with less surrounding context and
-    causing reconstruction artifacts at player boundaries.
+    Dilation is intentionally modest — (5,5)×1 instead of the previous
+    (7,7)×2 — so that valid background pixels immediately surrounding a player
+    are preserved.  Those pixels are the closest context for inpainting and
+    losing them was the primary cause of boundary artefacts.
     """
     mask = (mask > 0).astype(np.uint8)
     mask = _span_fill(mask)
 
-    if hasattr(cv2, "morphologyEx") and hasattr(cv2, "getStructuringElement"):
-        close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel, iterations=1)
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel, iterations=1)
 
-    # Modest dilation — enough to cover segmentation edges without destroying context
     mask = cv2.dilate(mask, np.ones((5, 5), np.uint8), iterations=1)
 
     return (mask > 0).astype(np.uint8)
 
 
-# -----------------------------
+# ---------------------------------------------------------------------------
 # Mask creation
-# -----------------------------
+# ---------------------------------------------------------------------------
 
 
 def create_player_removal_mask(
-    frame_shape,
-    boxes,
+    frame_shape: tuple,
+    boxes: np.ndarray,
     masks,
     selected_indices,
     auxiliary_masks=None,
-):
+) -> np.ndarray:
+    """
+    Merge per-player segmentation masks into one removal mask.
+
+    Priority: SAM mask > YOLO detector mask > bbox rectangle fallback.
+    """
     h, w = frame_shape
     final_mask = np.zeros((h, w), dtype=np.uint8)
 
@@ -128,8 +166,11 @@ def create_player_removal_mask(
             if dm is not None:
                 player_mask = np.maximum(player_mask, (dm > 0.4).astype(np.uint8))
 
-        player_mask = refine_player_mask(player_mask, bbox=(x1, y1, x2, y2), frame_shape=frame_shape)
+        player_mask = refine_player_mask(
+            player_mask, bbox=(x1, y1, x2, y2), frame_shape=frame_shape
+        )
 
+        # Bbox fallback if segmentation is degenerate
         if np.sum(player_mask) < 50:
             pad = 5
             x1p, y1p = max(0, x1 - pad), max(0, y1 - pad)
@@ -141,17 +182,24 @@ def create_player_removal_mask(
     return final_mask
 
 
-# -----------------------------
-# Temporal smoothing
-# -----------------------------
+# ---------------------------------------------------------------------------
+# Temporal mask smoothing
+# ---------------------------------------------------------------------------
 
 
 class TemporalMaskSmoother:
-    def __init__(self, history=5):
-        self.history = []
+    """
+    Weighted temporal union of recent masks.
+
+    Prevents mask jitter (flickering edges) without delaying mask shrinkage
+    when a player moves out of frame.
+    """
+
+    def __init__(self, history: int = 5):
+        self.history: list = []
         self.max_len = history
 
-    def smooth(self, mask):
+    def smooth(self, mask: np.ndarray) -> np.ndarray:
         mask = (mask > 0).astype(np.uint8)
         self.history.append(mask)
         if len(self.history) > self.max_len:
@@ -160,31 +208,41 @@ class TemporalMaskSmoother:
         combined = np.zeros_like(mask, dtype=np.float32)
         for i, m in enumerate(self.history):
             weight = (i + 1) / len(self.history)
-            combined += m * weight
+            combined += m.astype(np.float32) * weight
 
         if combined.max() > 0:
             combined /= combined.max()
 
         recent_union = np.maximum.reduce(self.history[-min(3, len(self.history)):])
         stable = (combined > 0.45).astype(np.uint8)
-        recovered = (combined > 0.2).astype(np.uint8) * recent_union
+        recovered = (combined > 0.20).astype(np.uint8) * recent_union
         smoothed = np.maximum(stable, recovered).astype(np.uint8)
 
         return refine_player_mask(smoothed)
 
 
-# -----------------------------
-# Frame composer
-# -----------------------------
+# ---------------------------------------------------------------------------
+# Temporal frame composer
+# ---------------------------------------------------------------------------
 
 
 class TemporalRemovalComposer:
-    def __init__(self, blend_alpha=0.15, feather_radius=21):
-        self.prev_output = None
+    """
+    Blend the current inpainted output with the previous output inside the
+    mask region to reduce per-frame flicker.
+
+    alpha=0.15 is intentionally low — just enough to smooth single-frame
+    glitches without smearing moving players' traces.
+    """
+
+    def __init__(self, blend_alpha: float = 0.15, feather_radius: int = 21):
+        self.prev_output: np.ndarray = None
         self.alpha = blend_alpha
         self.feather = feather_radius
 
-    def compose(self, frame, output, mask):
+    def compose(
+        self, frame: np.ndarray, output: np.ndarray, mask: np.ndarray
+    ) -> np.ndarray:
         if self.prev_output is None:
             self.prev_output = output.copy()
             return output
@@ -193,7 +251,7 @@ class TemporalRemovalComposer:
         temporal_alpha = np.clip(mask_f * self.alpha, 0.0, 1.0)
 
         blended = (
-            output.astype(np.float32) * (1 - temporal_alpha)
+            output.astype(np.float32) * (1.0 - temporal_alpha)
             + self.prev_output.astype(np.float32) * temporal_alpha
         )
 
@@ -201,136 +259,212 @@ class TemporalRemovalComposer:
         return self.prev_output
 
 
-# -----------------------------
-# Background reconstruction (fixed)
-# -----------------------------
+# ---------------------------------------------------------------------------
+# Background reconstruction
+# ---------------------------------------------------------------------------
+
+
+def _color_sample_fill(
+    frame: np.ndarray, mask: np.ndarray, base: np.ndarray
+) -> np.ndarray:
+    """
+    For pixels where background reconstruction has no data (deep occlusion),
+    sample the dominant colour from the unmasked boundary ring and use it to
+    seed the inpainted base.  This prevents TELEA smearing bright jersey
+    colours into the grass region on large holes.
+
+    The result is still blended with `base` so texture structure is preserved;
+    only the colour balance is corrected.
+    """
+    if np.sum(mask) == 0:
+        return base
+
+    # Dilate mask to get a ring of known-good border pixels
+    ring_outer = cv2.dilate(mask, np.ones((21, 21), np.uint8), iterations=1)
+    ring = (ring_outer > 0) & (mask == 0)
+
+    if np.sum(ring) < 10:
+        return base
+
+    # Median colour of the border ring (robust to player-adjacent pixels)
+    border_pixels = frame[ring]
+    median_colour = np.median(border_pixels, axis=0)  # shape (3,)
+
+    # Create a smooth colour fill inside the mask
+    colour_fill = np.zeros_like(frame, dtype=np.float32)
+    colour_fill[mask > 0] = median_colour
+
+    # Blend: 30% colour correction + 70% TELEA structure
+    alpha_colour = 0.30
+    result = base.copy().astype(np.float32)
+    m3 = (mask > 0)[..., None]
+    result = np.where(
+        m3,
+        result * (1.0 - alpha_colour) + colour_fill * alpha_colour,
+        result,
+    )
+    return np.clip(result, 0, 255).astype(np.uint8)
 
 
 class MotionCompensatedBackgroundReconstructor:
     """
-    Maintains a rolling buffer of background frames aligned to the current
-    camera position via sparse optical-flow homography estimation.
+    Rolling-buffer background reconstructor with homography alignment.
 
-    Key fixes vs. the original implementation
-    ------------------------------------------
-    1. **Multi-frame background buffer** — keeps N clean (unmasked) frames and
-       blends them after warping each to the current camera pose.  A single
-       previous frame is unreliable when players cover large areas.
+    Buffer entries
+    --------------
+    Each entry is a dict:
+        'frame' : np.ndarray  — raw BGR frame as captured (no inpainting)
+        'mask'  : np.ndarray  — uint8 binary; 1 where players were present
 
-    2. **Never bake inpainting artifacts into the background model.**
-       Only pixels that are *outside* the mask (i.e. genuine background) are
-       used to refresh the stored frames.  The old code wrote `output[mask]`
-       back into the background, which compounded inpainting errors over time.
+    SD injection
+    ------------
+    When Stable Diffusion produces a clean inpainted region, the caller can
+    call inject_clean_frame(sd_output) to insert it into the buffer with an
+    all-zeros mask.  Future reconstruct() calls will warp it to the current
+    camera pose via the same homography path, giving temporally consistent
+    SD results without a separate cache or any stale-pixel blending.
 
-    3. **Homography (8-DOF) instead of affine (6-DOF)** for the camera-motion
-       estimate.  Broadcast cameras pan, tilt, and zoom; affine cannot model
-       zoom-induced perspective, producing misaligned background patches.
-
-    4. **Fallback chain** when optical flow fails (too few features, heavy
-       occlusion, scene cut): use the most recent clean frame at its original
-       position, then fall back to OpenCV inpainting alone.  Previously the
-       code returned `base_output` unchanged after silently returning `None`
-       from `_warp_background`, but the caller then wrote those pixels (which
-       were often just zeros or stale) into the output mask region.
-
-    5. **Explicit validity check** on warped background pixels before using
-       them — pixels that map outside the frame boundary after the warp are
-       not used; the inpainted `base` is kept instead for those positions.
+    Reconstruction pipeline per frame
+    ----------------------------------
+    1. For each buffered frame (newest → oldest):
+       a. Estimate homography src→current via LK optical flow + RANSAC.
+       b. Warp frame and its occlusion mask into current camera space.
+       c. Compute per-pixel weight = frame_weight * (valid & ~occluded).
+       d. Accumulate into weighted sum.
+    2. Normalise accumulator → background estimate + validity map.
+    3. Fill mask region:
+       - valid background pixels  →  background estimate
+       - zero-weight pixels       →  colour-corrected TELEA fallback (base)
     """
 
-    # How many background frames to keep in the rolling buffer
-    BUFFER_SIZE = 12
+    # Rolling buffer size.  12 frames at 30 fps ≈ 0.4 s of history.
+    # Large enough to survive a player standing still for several frames,
+    # small enough that a panning camera does not accumulate stale alignment.
+    BUFFER_SIZE = 16
 
-    def __init__(self):
-        # Each entry: {'frame': ndarray, 'mask': ndarray}
-        # 'mask' marks which pixels were occluded by players (1 = occluded)
+    def __init__(self) -> None:
         self._buffer: deque = deque(maxlen=self.BUFFER_SIZE)
-        self._prev_gray = None   # For optical-flow feature tracking
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def reconstruct(self, frame: np.ndarray, mask: np.ndarray, base: np.ndarray) -> np.ndarray:
+    @property
+    def background(self) -> np.ndarray | None:
+        """Compatibility shim — returns the most recently buffered frame."""
+        if not self._buffer:
+            return None
+        return self._buffer[-1]["frame"]
+
+    def reconstruct(
+        self,
+        frame: np.ndarray,
+        mask: np.ndarray,
+        base: np.ndarray,
+    ) -> np.ndarray:
         """
-        Fill `mask` pixels in `frame` with background content.
+        Fill mask pixels in *frame* from the buffer.
 
         Parameters
         ----------
-        frame : BGR current frame (with players still visible)
-        mask  : binary (0/1) uint8 — 1 where players should be removed
-        base  : OpenCV-inpainted fallback (already computed by caller)
+        frame : current BGR frame (players visible, used for homography)
+        mask  : binary uint8 — 1 where players should be erased
+        base  : OpenCV-inpainted fallback for pixels with no buffer data
 
         Returns
         -------
-        output : BGR frame where mask pixels are filled from the background
+        BGR frame with mask region filled from aligned background history.
         """
-        if len(self._buffer) == 0:
-            # No history yet — caller's inpaint is the best we can do
-            return base.copy()
+        if not self._buffer:
+            return _color_sample_fill(frame, mask, base)
 
-        warped_bg, valid_map = self._build_background_estimate(frame, mask)
+        bg_estimate, valid_map = self._build_background_estimate(frame, mask)
 
-        # Start with the inpainted base as a safety net
-        output = base.copy()
+        # Start from TELEA base; overwrite only where buffer gives valid data
+        output = _color_sample_fill(frame, mask, base)
 
-        if warped_bg is not None:
-            # Only overwrite pixels where:
-            #   (a) we want to remove a player  (mask == 1)
-            #   (b) the warped background pixel is valid  (valid_map == 1)
+        if bg_estimate is not None:
             use = (mask > 0) & (valid_map > 0)
-            output[use] = warped_bg[use]
-
-            # For mask pixels where the warp gave no valid data, feather-blend
-            # the inpainted base with whatever background we have
-            partial = (mask > 0) & (valid_map == 0)
-            if np.any(partial):
-                # base already covers this via OpenCV inpaint; leave as-is
-                pass
+            if np.any(use):
+                # Feather the transition at the boundary for a smooth blend
+                alpha = feather_mask(use.astype(np.uint8), ksize=5)[..., None]
+                output = np.where(
+                    (mask > 0)[..., None],
+                    bg_estimate.astype(np.float32) * alpha
+                    + output.astype(np.float32) * (1.0 - alpha),
+                    output.astype(np.float32),
+                ).astype(np.uint8)
 
         return output
 
-    def update(self, frame: np.ndarray, output: np.ndarray, mask: np.ndarray):
+    def update(
+        self,
+        frame: np.ndarray,
+        output: np.ndarray,  # kept for API compatibility; NOT stored
+        mask: np.ndarray,
+    ) -> None:
         """
-        Record a new background frame.
+        Record the raw frame and its occlusion mask.
 
-        BUG FIX: we store the *original frame* rather than `output`.
-        The inpainted/reconstructed `output` may contain artefacts; feeding
-        it back as background causes error accumulation.  Instead we store
-        the raw frame and its occlusion mask so future calls can skip
-        occluded regions when compositing the background estimate.
+        IMPORTANT: `output` (the inpainted result) is deliberately ignored.
+        Storing processed output would feed inpainting artefacts back into
+        future reconstructions, causing error accumulation over time.
+        Only the raw camera frame is buffered.
         """
-        binary_mask = (mask > 0).astype(np.uint8) if mask is not None \
+        binary_mask = (
+            (mask > 0).astype(np.uint8)
+            if mask is not None
             else np.zeros(frame.shape[:2], dtype=np.uint8)
-        self._buffer.append({
-            'frame': frame.copy(),
-            'mask': binary_mask,
-        })
-        # Update the grayscale reference used for optical flow
-        self._prev_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        )
+        self._buffer.append({"frame": frame.copy(), "mask": binary_mask})
+
+    def inject_clean_frame(self, clean_bgr: np.ndarray) -> None:
+        """
+        Insert a fully clean background frame (e.g. SD inpaint output) into
+        the buffer with an all-zeros mask.
+
+        This frame will be warped to future camera poses by the same homography
+        path as regular frames, so its pixels are reused in a camera-consistent
+        manner without any extra caching logic in the caller.
+
+        Call this immediately after a successful SD inpaint.
+        """
+        h, w = clean_bgr.shape[:2]
+        self._buffer.append(
+            {
+                "frame": clean_bgr.copy(),
+                "mask": np.zeros((h, w), dtype=np.uint8),  # all pixels clean
+            }
+        )
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _estimate_homography(self, src_gray: np.ndarray, dst_gray: np.ndarray,
-                              combined_occlusion: np.ndarray):
+    def _estimate_homography(
+        self,
+        src_gray: np.ndarray,
+        dst_gray: np.ndarray,
+        combined_occlusion: np.ndarray,
+    ) -> np.ndarray | None:
         """
-        Estimate the homography that maps `src_gray` → `dst_gray` using
-        sparse Lucas-Kanade optical flow on background feature points.
+        Estimate 8-DOF homography src → dst via sparse LK optical flow + RANSAC.
 
-        Returns H (3×3) or None on failure.
+        Features are detected only in regions free of player occlusion in both
+        src and dst.  Homography (vs. affine) correctly handles camera zoom.
+
+        Returns H (3×3 float64) or None on failure.
         """
-        # Build feature-detection mask: avoid player regions in BOTH frames
         feature_mask = np.ones(src_gray.shape, dtype=np.uint8) * 255
         feature_mask[combined_occlusion > 0] = 0
 
-        if np.count_nonzero(feature_mask) < 500:
-            return None  # Too much occlusion to get reliable features
+        # Need a reasonable number of pixels free of occlusion
+        if np.count_nonzero(feature_mask) < 1000:
+            return None
 
         pts_src = cv2.goodFeaturesToTrack(
             src_gray,
-            maxCorners=500,
+            maxCorners=600,
             qualityLevel=0.01,
             minDistance=7,
             mask=feature_mask,
@@ -339,8 +473,12 @@ class MotionCompensatedBackgroundReconstructor:
             return None
 
         pts_dst, status, _ = cv2.calcOpticalFlowPyrLK(
-            src_gray, dst_gray, pts_src, None,
-            winSize=(21, 21), maxLevel=3,
+            src_gray,
+            dst_gray,
+            pts_src,
+            None,
+            winSize=(21, 21),
+            maxLevel=3,
         )
         if pts_dst is None or status is None:
             return None
@@ -350,8 +488,10 @@ class MotionCompensatedBackgroundReconstructor:
             return None
 
         H, inlier_mask = cv2.findHomography(
-            pts_src[keep], pts_dst[keep],
-            cv2.RANSAC, ransacReprojThreshold=3.0,
+            pts_src[keep],
+            pts_dst[keep],
+            cv2.RANSAC,
+            ransacReprojThreshold=3.0,
         )
         if H is None:
             return None
@@ -362,38 +502,57 @@ class MotionCompensatedBackgroundReconstructor:
 
         return H
 
-    def _warp_frame(self, src: np.ndarray, H: np.ndarray,
-                    target_shape) -> tuple:
+    def _warp_with_validity(
+        self,
+        src: np.ndarray,
+        H: np.ndarray,
+        target_shape: tuple,
+    ) -> tuple[np.ndarray, np.ndarray]:
         """
-        Warp `src` by H and return (warped_bgr, valid_pixel_mask).
-        `valid_pixel_mask` is 1 where the warp produced an in-bounds pixel.
-        """
-        h, w = target_shape[:2]
-
-        # Validity map: start all-ones, warp to find which output pixels came
-        # from inside the source image bounds.
-        ones = np.ones((src.shape[0], src.shape[1]), dtype=np.float32)
-        warped = cv2.warpPerspective(src, H, (w, h),
-                                     flags=cv2.INTER_LINEAR,
-                                     borderMode=cv2.BORDER_CONSTANT,
-                                     borderValue=0)
-        valid = cv2.warpPerspective(ones, H, (w, h),
-                                    flags=cv2.INTER_NEAREST,
-                                    borderMode=cv2.BORDER_CONSTANT,
-                                    borderValue=0)
-        valid_mask = (valid > 0.5).astype(np.uint8)
-        return warped, valid_mask
-
-    def _build_background_estimate(self, current_frame: np.ndarray,
-                                   current_mask: np.ndarray):
-        """
-        Warp all buffered background frames into the current camera pose and
-        blend them into a single background estimate.
+        Warp *src* by homography H into *target_shape* space.
 
         Returns
         -------
-        bg_estimate : BGR ndarray or None
-        valid_map   : uint8 mask (1 where bg_estimate is valid)
+        warped    : BGR ndarray in target space
+        valid_map : uint8 mask; 1 where source pixels existed (no border fill)
+        """
+        h, w = target_shape[:2]
+        src_ones = np.ones(src.shape[:2], dtype=np.float32)
+
+        warped = cv2.warpPerspective(
+            src, H, (w, h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+        valid_raw = cv2.warpPerspective(
+            src_ones, H, (w, h),
+            flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+        valid_map = (valid_raw > 0.5).astype(np.uint8)
+        return warped, valid_map
+
+    def _build_background_estimate(
+        self,
+        current_frame: np.ndarray,
+        current_mask: np.ndarray,
+    ) -> tuple[np.ndarray | None, np.ndarray]:
+        """
+        Warp all buffered frames into the current camera pose and blend them.
+
+        Each buffered frame's contribution to a pixel is gated by:
+          - homography validity (pixel maps from inside source bounds)
+          - source occlusion mask (pixel was not covered by a player there either)
+
+        Exponential time-decay weights (newest ≈ 1.0, oldest ≈ e^{-0.35*N})
+        ensure recent clean observations dominate.
+
+        Returns
+        -------
+        bg_estimate : (H, W, 3) uint8 or None
+        valid_map   : (H, W) uint8, 1 where bg_estimate has data
         """
         h, w = current_frame.shape[:2]
         curr_gray = cv2.cvtColor(current_frame, cv2.COLOR_BGR2GRAY)
@@ -401,46 +560,45 @@ class MotionCompensatedBackgroundReconstructor:
         accum = np.zeros((h, w, 3), dtype=np.float32)
         weight_sum = np.zeros((h, w), dtype=np.float32)
 
-        # Walk the buffer from newest to oldest; newer frames get more weight
-        entries = list(self._buffer)  # oldest → newest
-        n = len(entries)
+        # Iterate newest-first so idx==0 is most recent
+        entries = list(self._buffer)  # oldest … newest
+        for idx, entry in enumerate(reversed(entries)):
+            src_frame: np.ndarray = entry["frame"]
+            src_occ: np.ndarray = entry["mask"]
 
-        for idx, entry in enumerate(reversed(entries)):  # newest first
-            src_frame = entry['frame']
-            src_mask = entry['mask']
             src_gray = cv2.cvtColor(src_frame, cv2.COLOR_BGR2GRAY)
-
-            # Combined occlusion mask for feature matching
-            combined_occ = np.maximum(src_mask, current_mask)
+            combined_occ = np.maximum(src_occ, current_mask)
 
             H = self._estimate_homography(src_gray, curr_gray, combined_occ)
 
             if H is not None:
-                warped, valid = self._warp_frame(src_frame, H, current_frame.shape)
+                warped, hw_valid = self._warp_with_validity(
+                    src_frame, H, current_frame.shape
+                )
+                # Warp the source occlusion mask into current space
+                occ_warped_f, _ = self._warp_with_validity(
+                    src_occ.astype(np.float32), H, current_frame.shape
+                )
+                occ_warped = (occ_warped_f > 0.3).astype(np.uint8)
             else:
                 if idx == 0:
-                    # Most-recent frame, no homography — use direct copy
-                    # (handles near-static camera or scene cuts gracefully)
+                    # Most-recent frame with no usable homography (scene cut,
+                    # near-static camera, etc.) — use it unwarped as a
+                    # last-resort anchor.
                     warped = src_frame.copy()
-                    valid = np.ones((h, w), dtype=np.uint8)
+                    hw_valid = np.ones((h, w), dtype=np.uint8)
+                    occ_warped = src_occ
                 else:
-                    continue  # Skip older frames if we can't align them
+                    # Older frame + no alignment = unreliable; skip it.
+                    continue
 
-            # Don't use pixels that were occluded in the source frame
-            # (they may themselves be filled with artefacts)
-            src_mask_warped = np.zeros((h, w), dtype=np.uint8)
-            if H is not None and np.any(src_mask > 0):
-                src_mask_warped, _ = self._warp_frame(
-                    src_mask.astype(np.float32), H, current_frame.shape
-                )
-                src_mask_warped = (src_mask_warped > 0.3).astype(np.uint8)
-            else:
-                src_mask_warped = src_mask
+            # Only use pixels that are:
+            #   a) within source image bounds after the warp
+            #   b) NOT occluded in the source frame
+            use = (hw_valid > 0) & (occ_warped == 0)
 
-            use = (valid > 0) & (src_mask_warped == 0)
-
-            # Exponential decay: newest frame has highest weight
-            frame_weight = np.exp(-idx * 0.35)  # ~1.0, 0.70, 0.50, 0.36 …
+            # Exponential decay: idx 0 → weight≈1.0, idx 1 → 0.70, idx 2 → 0.50 …
+            frame_weight = float(np.exp(-idx * 0.35))
             pixel_weight = use.astype(np.float32) * frame_weight
 
             accum += warped.astype(np.float32) * pixel_weight[..., None]
@@ -450,20 +608,24 @@ class MotionCompensatedBackgroundReconstructor:
         if np.all(no_data):
             return None, np.zeros((h, w), dtype=np.uint8)
 
-        # Normalise
-        safe_weight = np.where(no_data, 1.0, weight_sum)
-        bg_estimate = (accum / safe_weight[..., None]).astype(np.uint8)
-
+        safe_w = np.where(no_data, 1.0, weight_sum)
+        bg_estimate = np.clip(accum / safe_w[..., None], 0, 255).astype(np.uint8)
         valid_map = (~no_data).astype(np.uint8)
+
         return bg_estimate, valid_map
 
 
-# -----------------------------
+# ---------------------------------------------------------------------------
 # Debug / UI helper
-# -----------------------------
+# ---------------------------------------------------------------------------
 
 
-def draw_selected_players(frame, boxes, selected_indices, id_mapping=None):
+def draw_selected_players(
+    frame: np.ndarray,
+    boxes: np.ndarray,
+    selected_indices,
+    id_mapping: dict = None,
+) -> np.ndarray:
     output = frame.copy()
     for i, box in enumerate(boxes):
         x1, y1, x2, y2 = map(int, box[:4])
@@ -471,7 +633,13 @@ def draw_selected_players(frame, boxes, selected_indices, id_mapping=None):
         color = (0, 0, 255) if pid in selected_indices else (0, 255, 0)
         cv2.rectangle(output, (x1, y1), (x2, y2), color, 2)
         cv2.putText(
-            output, f"ID {pid}", (x1, y1 - 5),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA,
+            output,
+            f"ID {pid}",
+            (x1, y1 - 5),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            color,
+            1,
+            cv2.LINE_AA,
         )
     return output
