@@ -2,6 +2,7 @@ import sys
 import types
 
 import numpy as np
+import pytest
 
 sys.modules.setdefault(
     "cv2",
@@ -65,6 +66,46 @@ def test_reconstructor_update_preserves_clean_background():
     assert reconstructor.background is not None
     np.testing.assert_array_equal(reconstructor.background[0, 0], frame[0, 0])
     np.testing.assert_array_equal(reconstructor.background[1, 1], output[1, 1])
+
+
+def test_reconstructor_compensates_for_camera_translation():
+    import cv2
+
+    required_ops = (
+        "cvtColor",
+        "goodFeaturesToTrack",
+        "calcOpticalFlowPyrLK",
+        "estimateAffinePartial2D",
+        "warpAffine",
+    )
+    if not all(hasattr(cv2, op) for op in required_ops):
+        pytest.skip("OpenCV motion-estimation APIs unavailable in this environment")
+
+    reconstructor = MotionCompensatedBackgroundReconstructor()
+    rng = np.random.default_rng(7)
+
+    frame = rng.integers(0, 255, size=(64, 64, 3), dtype=np.uint8)
+    reconstructor.update(frame, frame, np.zeros((64, 64), dtype=np.uint8))
+
+    dx, dy = 3, 2
+    translated = np.zeros_like(frame)
+    translated[dy:, dx:] = frame[:-dy, :-dx]
+
+    mask = np.zeros((64, 64), dtype=np.uint8)
+    mask[24:36, 24:36] = 1
+    base = np.zeros_like(frame)
+
+    reconstructed = reconstructor.reconstruct(translated, mask, base)
+
+    expected_patch = translated[mask > 0].astype(np.int16)
+    actual_patch = reconstructed[mask > 0].astype(np.int16)
+    stale_patch = frame[mask > 0].astype(np.int16)
+
+    aligned_error = np.mean(np.abs(actual_patch - expected_patch))
+    stale_error = np.mean(np.abs(stale_patch - expected_patch))
+
+    assert aligned_error < 3.0
+    assert aligned_error < stale_error * 0.1
 
 
 def test_temporal_composer_keeps_masked_region_bright():
