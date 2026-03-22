@@ -19,12 +19,12 @@ from processing.effects import (
 from processing.sd_inpainting import SDInpainter
 
 # ---------------------------------------------------------------------------
-# Constants
+# Constants (UPDATED FOR DEBUG)
 # ---------------------------------------------------------------------------
 
-SD_BLEND_ALPHA = 0.55
-SD_INTERVAL = 8
-SD_MIN_MASK_PX = 400
+SD_BLEND_ALPHA = 0.6
+SD_INTERVAL = 2
+SD_MIN_MASK_PX = 100
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -33,9 +33,7 @@ SD_MIN_MASK_PX = 400
 def load_selection() -> set:
     path = Path("selection.json")
     if not path.exists():
-        raise FileNotFoundError(
-            "selection.json not found. Run the selection step first or provide the file."
-        )
+        raise FileNotFoundError("selection.json not found.")
     with path.open("r") as f:
         return set(json.load(f)["selected_ids"])
 
@@ -83,9 +81,6 @@ def main():
         fps,
         (width, height),
     )
-    if not writer.isOpened():
-        cap.release()
-        raise RuntimeError(f"Cannot create output video: {args.output}")
 
     detector = PlayerDetector(YOLO_MODEL_NAME, DETECTION_CLASSES)
     tracker = PlayerTracker()
@@ -105,22 +100,18 @@ def main():
         frame_idx += 1
         boxes, detector_masks = detector.detect(frame)
 
-        # ── No detections ───────────────────────────────────────────────
         if boxes is None or len(boxes) == 0:
             reconstructor.update(
                 frame,
                 frame,
-                np.zeros(frame.shape[:2], dtype=np.uint8),
+                np.zeros(frame.shape[:2], dtype=np.uint8)
             )
             writer.write(frame)
-            print(f"\rFrame {frame_idx}", end="", flush=True)
             continue
 
-        # ── Players detected ────────────────────────────────────────────
         tracker.update(boxes)
         selected_indices = tracker.get_detection_indices(selected_ids)
 
-        # FIX 1: Correct mask creation (use detector as auxiliary)
         mask = create_player_removal_mask(
             frame.shape[:2],
             boxes,
@@ -133,26 +124,22 @@ def main():
         mask = mask_smoother.smooth(mask)
 
         if np.sum(mask) > 0:
-            # FIX 2: Clean mask before inpainting
+
+            # Clean mask
             mask_clean = cv2.medianBlur((mask * 255).astype(np.uint8), 5)
             mask255 = (mask_clean > 127).astype(np.uint8) * 255
 
-            # Step 1: Classical inpaint
+            # Base inpaint
             base = cv2.inpaint(frame, mask255, 4, cv2.INPAINT_TELEA)
 
-            # Step 2: Background reconstruction
+            # Reconstruction (still used as structure)
             reconstructed = reconstructor.reconstruct(frame, mask, base)
 
-            # FIX 3: safer fallback threshold
             if np.mean(reconstructed[mask > 0]) < 5:
                 reconstructed = base
 
-            # Step 3: Stable Diffusion
-            run_sd = (
-                sd.enabled
-                and (frame_idx % SD_INTERVAL == 0)
-                and (int(np.sum(mask)) > SD_MIN_MASK_PX)
-            )
+            # 🔥 FORCE SD (isolation test)
+            run_sd = True
 
             if run_sd:
                 sd_result = sd.inpaint(reconstructed, mask)
@@ -168,10 +155,7 @@ def main():
             else:
                 output = reconstructed
 
-            # Step 4: Temporal smoothing
             output = composer.compose(frame, output, mask)
-
-            # Step 5: Update buffer (RAW frame)
             reconstructor.update(frame, output, mask)
 
         else:
