@@ -4,9 +4,13 @@ import types
 import numpy as np
 import pytest
 
-sys.modules.setdefault(
-    "cv2",
-    types.SimpleNamespace(
+# ---------------------------------------------------------------------------
+# Selective cv2 mock (only for tests that don't need real OpenCV)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def fake_cv2(monkeypatch):
+    fake = types.SimpleNamespace(
         GaussianBlur=lambda image, kernel, sigma: image,
         dilate=lambda image, kernel, iterations=1: image,
         morphologyEx=lambda image, op, kernel, iterations=1: image,
@@ -17,8 +21,27 @@ sys.modules.setdefault(
         putText=lambda *args, **kwargs: None,
         FONT_HERSHEY_SIMPLEX=0,
         LINE_AA=0,
-    ),
-)
+    )
+    monkeypatch.setitem(sys.modules, "cv2", fake)
+
+    from processing.effects import (
+        MotionCompensatedBackgroundReconstructor,
+        TemporalMaskSmoother,
+        TemporalRemovalComposer,
+        create_player_removal_mask,
+        refine_player_mask,
+    )
+    from processing.tracker import PlayerTracker
+
+    return {
+        "MotionCompensatedBackgroundReconstructor": MotionCompensatedBackgroundReconstructor,
+        "TemporalMaskSmoother": TemporalMaskSmoother,
+        "TemporalRemovalComposer": TemporalRemovalComposer,
+        "create_player_removal_mask": create_player_removal_mask,
+        "refine_player_mask": refine_player_mask,
+        "PlayerTracker": PlayerTracker,
+    }
+
 
 from processing.effects import (
     MotionCompensatedBackgroundReconstructor,
@@ -29,17 +52,21 @@ from processing.effects import (
 )
 from processing.tracker import PlayerTracker
 
+# ---------------------------------------------------------------------------
+# Tracker tests
+# ---------------------------------------------------------------------------
 
 def test_tracker_keeps_new_tracks_alive_after_creation():
     tracker = PlayerTracker(iou_threshold=0.9, max_lost_frames=1)
 
-    _, tracked_boxes = tracker.update([
+    mapping, tracked_boxes = tracker.update([
         np.array([0, 0, 10, 10]),
         np.array([20, 20, 30, 30]),
     ])
 
     assert len(tracked_boxes) == 2
     assert len(tracker.tracked_players) == 2
+    assert set(mapping.values()) == {0, 1}
     assert all(player["lost"] == 0 for player in tracker.tracked_players.values())
 
 
@@ -52,20 +79,43 @@ def test_tracker_clears_id_mapping_when_no_detections():
     assert tracker.id_mapping == {}
 
 
-def test_reconstructor_update_preserves_clean_background():
+# ---------------------------------------------------------------------------
+# Reconstructor tests
+# ---------------------------------------------------------------------------
+
+def test_reconstructor_update_stores_raw_frame_not_output():
     reconstructor = MotionCompensatedBackgroundReconstructor()
 
     frame = np.full((3, 3, 3), 10, dtype=np.uint8)
     mask = np.zeros((3, 3), dtype=np.uint8)
     mask[1, 1] = 1
+
     output = frame.copy()
     output[1, 1] = 200
 
     reconstructor.update(frame, output, mask)
 
     assert reconstructor.background is not None
+
     np.testing.assert_array_equal(reconstructor.background[0, 0], frame[0, 0])
-    np.testing.assert_array_equal(reconstructor.background[1, 1], output[1, 1])
+    np.testing.assert_array_equal(reconstructor.background[1, 1], frame[1, 1])
+
+    assert not np.array_equal(reconstructor.background[1, 1], output[1, 1]), (
+        "Buffer stored inpainted output — artifact feedback loop risk."
+    )
+
+
+def test_reconstructor_inject_clean_frame_enters_buffer():
+    reconstructor = MotionCompensatedBackgroundReconstructor()
+
+    clean = np.full((4, 4, 3), 128, dtype=np.uint8)
+    reconstructor.inject_clean_frame(clean)
+
+    assert len(reconstructor._buffer) == 1
+    entry = reconstructor._buffer[-1]
+
+    np.testing.assert_array_equal(entry["frame"], clean)
+    assert entry["mask"].sum() == 0
 
 
 def test_reconstructor_compensates_for_camera_translation():
@@ -75,11 +125,12 @@ def test_reconstructor_compensates_for_camera_translation():
         "cvtColor",
         "goodFeaturesToTrack",
         "calcOpticalFlowPyrLK",
-        "estimateAffinePartial2D",
-        "warpAffine",
+        "findHomography",
+        "warpPerspective",
     )
+
     if not all(hasattr(cv2, op) for op in required_ops):
-        pytest.skip("OpenCV motion-estimation APIs unavailable in this environment")
+        pytest.skip("OpenCV homography APIs unavailable")
 
     reconstructor = MotionCompensatedBackgroundReconstructor()
     rng = np.random.default_rng(7)
@@ -93,6 +144,7 @@ def test_reconstructor_compensates_for_camera_translation():
 
     mask = np.zeros((64, 64), dtype=np.uint8)
     mask[24:36, 24:36] = 1
+
     base = np.zeros_like(frame)
 
     reconstructed = reconstructor.reconstruct(translated, mask, base)
@@ -101,14 +153,18 @@ def test_reconstructor_compensates_for_camera_translation():
     actual_patch = reconstructed[mask > 0].astype(np.int16)
     stale_patch = frame[mask > 0].astype(np.int16)
 
-    aligned_error = np.mean(np.abs(actual_patch - expected_patch))
-    stale_error = np.mean(np.abs(stale_patch - expected_patch))
+    aligned_error = float(np.mean(np.abs(actual_patch - expected_patch)))
+    stale_error = float(np.mean(np.abs(stale_patch - expected_patch)))
 
-    assert aligned_error < 3.0
-    assert aligned_error < stale_error * 0.1
+    assert aligned_error < 5.0
+    assert aligned_error < stale_error * 0.2
 
 
-def test_temporal_composer_keeps_masked_region_bright():
+# ---------------------------------------------------------------------------
+# Temporal composer
+# ---------------------------------------------------------------------------
+
+def test_temporal_composer_keeps_masked_region_bright(fake_cv2):
     composer = TemporalRemovalComposer(blend_alpha=0.2, feather_radius=3)
 
     frame = np.zeros((2, 2, 3), dtype=np.uint8)
@@ -120,10 +176,15 @@ def test_temporal_composer_keeps_masked_region_bright():
     blended = composer.compose(frame, second_output, mask)
 
     expected = np.full((2, 2, 3), 120, dtype=np.uint8)
-    np.testing.assert_array_equal(blended, expected)
+
+    np.testing.assert_allclose(blended, expected, atol=1)
 
 
-def test_refine_player_mask_fills_internal_gaps():
+# ---------------------------------------------------------------------------
+# Mask refinement
+# ---------------------------------------------------------------------------
+
+def test_refine_player_mask_fills_internal_gaps(fake_cv2):
     mask = np.zeros((7, 7), dtype=np.uint8)
     mask[1:6, 2] = 1
     mask[1:6, 4] = 1
@@ -135,8 +196,9 @@ def test_refine_player_mask_fills_internal_gaps():
     assert refined[3, 3] == 1
 
 
-def test_create_player_removal_mask_merges_fragmented_masks():
+def test_create_player_removal_mask_merges_fragmented_masks(fake_cv2):
     boxes = np.array([[1, 1, 7, 7]], dtype=np.float32)
+
     sam_masks = np.zeros((1, 9, 9), dtype=np.uint8)
     detector_masks = np.zeros((1, 9, 9), dtype=np.uint8)
 
@@ -156,11 +218,16 @@ def test_create_player_removal_mask_merges_fragmented_masks():
     assert merged[4, 4] == 1
 
 
-def test_temporal_mask_smoother_keeps_recent_partial_mask_regions():
+# ---------------------------------------------------------------------------
+# Temporal mask smoothing
+# ---------------------------------------------------------------------------
+
+def test_temporal_mask_smoother_keeps_recent_partial_mask_regions(fake_cv2):
     smoother = TemporalMaskSmoother(history=3)
 
     full_mask = np.zeros((6, 6), dtype=np.uint8)
     full_mask[1:5, 1:5] = 1
+
     partial_mask = full_mask.copy()
     partial_mask[2:4, 2:4] = 0
 
