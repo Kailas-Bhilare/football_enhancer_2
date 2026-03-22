@@ -216,38 +216,121 @@ class MotionCompensatedBackgroundReconstructor:
 
     def __init__(self):
         self.background = None
+        self.prev_frame = None
+        self.prev_mask = None
+
+    def _estimate_camera_transform(self, frame, mask):
+        if self.prev_frame is None or self.background is None:
+            return None
+
+        required_ops = (
+            "cvtColor",
+            "goodFeaturesToTrack",
+            "calcOpticalFlowPyrLK",
+            "estimateAffinePartial2D",
+        )
+        if not all(hasattr(cv2, op) for op in required_ops):
+            return None
+
+        prev_gray = cv2.cvtColor(self.prev_frame, cv2.COLOR_BGR2GRAY)
+        curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        valid_mask = np.ones(mask.shape, dtype=np.uint8) * 255
+        valid_mask[mask > 0] = 0
+
+        if self.prev_mask is not None:
+            valid_mask[self.prev_mask > 0] = 0
+
+        if np.count_nonzero(valid_mask) < 32:
+            return None
+
+        prev_pts = cv2.goodFeaturesToTrack(
+            prev_gray,
+            maxCorners=300,
+            qualityLevel=0.01,
+            minDistance=7,
+            mask=valid_mask,
+        )
+
+        if prev_pts is None or len(prev_pts) < 6:
+            return None
+
+        curr_pts, status, _ = cv2.calcOpticalFlowPyrLK(prev_gray, curr_gray, prev_pts, None)
+        if curr_pts is None or status is None:
+            return None
+
+        keep = status.reshape(-1) == 1
+        if np.count_nonzero(keep) < 6:
+            return None
+
+        matrix, _ = cv2.estimateAffinePartial2D(
+            prev_pts[keep],
+            curr_pts[keep],
+            method=getattr(cv2, "RANSAC", 0),
+            ransacReprojThreshold=3.0,
+        )
+
+        return matrix
+
+    def _warp_background(self, frame, mask):
+        if self.background is None:
+            return None
+
+        matrix = self._estimate_camera_transform(frame, mask)
+        if matrix is None or not hasattr(cv2, "warpAffine"):
+            return self.background.copy()
+
+        height, width = frame.shape[:2]
+        return cv2.warpAffine(
+            self.background,
+            matrix,
+            (width, height),
+            flags=getattr(cv2, "INTER_LINEAR", 1),
+            borderMode=getattr(cv2, "BORDER_REPLICATE", 1),
+        )
 
     def reconstruct(self, frame, mask, base):
 
         if self.background is None:
             self.background = frame.copy()
+            self.prev_frame = frame.copy()
+            self.prev_mask = (mask > 0).astype(np.uint8)
 
+        aligned_background = self._warp_background(frame, mask)
         inv_mask = (mask == 0).astype(np.uint8)
 
-        # update only stable regions
-        self.background = np.where(
+        # refresh stable regions from the current frame in camera-aligned space
+        refreshed_background = np.where(
             inv_mask[..., None] == 1,
             frame,
-            self.background
+            aligned_background
         )
 
         result = base.copy()
 
-        # fill ONLY masked region
-        result[mask > 0] = self.background[mask > 0]
+        # fill only the removed player region from the aligned background estimate
+        result[mask > 0] = refreshed_background[mask > 0]
+
+        self.background = refreshed_background
 
         return result
 
     def update(self, frame, output, mask):
         if self.background is None:
             self.background = output.copy()
+            self.prev_frame = frame.copy()
+            self.prev_mask = None if mask is None else (mask > 0).astype(np.uint8)
             return
 
-        safe_output = output.copy()
-        if mask is not None:
-            safe_output[mask == 0] = frame[mask == 0]
+        safe_output = self.background.copy()
+        if mask is None:
+            safe_output = output.copy()
+        else:
+            safe_output[mask > 0] = output[mask > 0]
 
         self.background = safe_output
+        self.prev_frame = frame.copy()
+        self.prev_mask = None if mask is None else (mask > 0).astype(np.uint8)
 
 
 # -----------------------------
