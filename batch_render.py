@@ -16,9 +16,9 @@ def load_selection():
 
 
 def smooth_mask(mask):
-    mask = cv2.dilate(mask, np.ones((5, 5), np.uint8), 1)
-    mask = cv2.GaussianBlur(mask, (15, 15), 0)
-    return (mask > 0.25).astype(np.uint8)
+    # Less aggressive smoothing (prevents eating background)
+    mask = cv2.GaussianBlur(mask.astype(np.float32), (11, 11), 0)
+    return (mask > 0.3).astype(np.uint8)
 
 
 def resize_for_sd(frame, mask, size=256):
@@ -34,10 +34,11 @@ def upscale_back(frame_small, orig_size):
 
 def blend_edges(original, generated, mask):
     """
-    Feather blend to avoid SD seams
+    Feather blend to remove SD seams and artifacts
     """
     mask_f = cv2.GaussianBlur(mask.astype(np.float32), (31, 31), 0)[..., None]
-    return (generated * mask_f + original * (1 - mask_f)).astype(np.uint8)
+    blended = generated * mask_f + original * (1 - mask_f)
+    return np.clip(blended, 0, 255).astype(np.uint8)
 
 
 def main():
@@ -82,6 +83,7 @@ def main():
             continue
 
         tracker.update(boxes)
+
         selected_indices = tracker.get_detection_indices(selected_ids)
 
         mask = create_player_removal_mask(
@@ -96,25 +98,26 @@ def main():
         if np.sum(mask) > 0:
             small_frame, small_mask, orig_size = resize_for_sd(frame, mask)
 
-            sd_out_small = sd.inpaint(small_frame, small_mask)
+            output_small = sd.inpaint(small_frame, small_mask)
 
-            if sd_out_small is not None:
-                sd_out = upscale_back(sd_out_small, orig_size)
+            if output_small is not None:
+                sd_up = upscale_back(output_small, orig_size)
 
-                # 🔥 Key: blend instead of full replace
-                output = blend_edges(frame, sd_out, mask)
+                # 🔥 Key fix: blend instead of replace
+                output = blend_edges(frame, sd_up, mask)
             else:
                 output = frame.copy()
         else:
             output = frame.copy()
 
-        # 🔥 Reduced temporal smoothing (less ghosting)
+        # Temporal smoothing
         if prev_output is not None:
-            output = cv2.addWeighted(prev_output, 0.4, output, 0.6, 0)
+            output = cv2.addWeighted(prev_output, 0.7, output, 0.3, 0)
 
         prev_output = output.copy()
 
         writer.write(output.astype(np.uint8))
+
         print(f"\rFrame {frame_idx}", end="")
 
     cap.release()
