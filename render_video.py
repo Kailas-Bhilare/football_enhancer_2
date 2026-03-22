@@ -1,3 +1,24 @@
+"""
+render_video.py
+
+Two-step rendering pipeline:
+  1. Player selection  (main.py)
+  2. Background reconstruction + inpainting  (this file)
+
+Reconstruction pipeline per frame
+----------------------------------
+  a. Detect players (YOLO) + refine masks (SAM when available).
+  b. Build removal mask → stabilise → temporally smooth.
+  c. Classical inpaint (TELEA) as fast fallback.
+  d. MotionCompensatedBackgroundReconstructor fills mask from aligned buffer.
+  e. SD inpainting runs every SD_INTERVAL frames on large masks; result is
+     injected back into the reconstructor buffer so future frames receive it
+     through the same homography-alignment path — no separate stale cache.
+  f. TemporalRemovalComposer smooths per-frame flicker.
+  g. Raw frame (not output) is stored in the reconstructor buffer to prevent
+     artifact feedback loops.
+"""
+
 import cv2
 import json
 import argparse
@@ -6,7 +27,10 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from config import *
+from config import (
+    YOLO_MODEL_NAME,
+    DETECTION_CLASSES,
+)
 from models.detector import PlayerDetector
 from processing.tracker import PlayerTracker
 from processing.effects import (
@@ -21,68 +45,95 @@ from processing.sd_inpainting import SDInpainter
 from processing.sam_refiner import SAMRefiner
 
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
 MASK_HISTORY = 6
-SD_BLEND_ALPHA = 0.45
 
-# Run SD inpainting every N frames when the mask is large enough.
-# Lowered from 15 → 8 so the generative result stays fresh without
-# letting OpenCV-only frames dominate the background model.
+# Run SD every N frames when the mask is large enough.
+# SD output is injected into the background buffer, so the result persists
+# across future frames via homography alignment — no stale cache needed.
 SD_INTERVAL = 8
-SD_MIN_MASK_PIXELS = 500
+SD_MIN_MASK_PIXELS = 400
+
+SD_BLEND_ALPHA = 0.55  # How strongly to blend SD result over reconstruction
 
 
-def load_selection():
-    selection_path = Path("selection.json")
-    if not selection_path.exists():
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def load_selection() -> set:
+    path = Path("selection.json")
+    if not path.exists():
         raise FileNotFoundError(
             "selection.json not found. Run the selection step first."
         )
-    with selection_path.open("r") as f:
+    with path.open("r") as f:
         return set(json.load(f)["selected_ids"])
 
 
-def normalize_frame(frame, width, height):
+def normalize_frame(frame: np.ndarray, width: int, height: int) -> np.ndarray:
     if frame.shape[:2] != (height, width):
         frame = cv2.resize(frame, (width, height))
     return frame.astype(np.uint8)
 
 
-def prepare_debug_directory(debug_dir, clean=False):
-    debug_path = Path(debug_dir)
-    if clean and debug_path.exists():
-        shutil.rmtree(debug_path)
-    debug_path.mkdir(parents=True, exist_ok=True)
-    return debug_path
+def prepare_debug_directory(debug_dir, clean: bool = False) -> Path:
+    p = Path(debug_dir)
+    if clean and p.exists():
+        shutil.rmtree(p)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
 
-def save_debug_frame(debug_dir, frame_idx, frame):
-    frame_path = Path(debug_dir) / f"frame_{frame_idx:04d}.png"
-    success = cv2.imwrite(str(frame_path), frame)
-    if not success:
-        raise RuntimeError(f"Failed to write debug frame: {frame_path}")
-    return frame_path
+def save_debug_frame(debug_dir: Path, frame_idx: int, frame: np.ndarray) -> Path:
+    fp = Path(debug_dir) / f"frame_{frame_idx:04d}.png"
+    if not cv2.imwrite(str(fp), frame):
+        raise RuntimeError(f"Failed to write debug frame: {fp}")
+    return fp
 
 
-def blend_sd_result(base, sd, mask, alpha=SD_BLEND_ALPHA):
-    if sd is None:
-        return base
-    if sd.shape != base.shape:
-        sd = cv2.resize(sd, (base.shape[1], base.shape[0]))
-    mask_alpha = feather_mask(mask, 25)[..., None] * alpha
-    return np.clip(
-        base.astype(np.float32) * (1 - mask_alpha) +
-        sd.astype(np.float32) * mask_alpha,
-        0, 255,
-    ).astype(np.uint8)
+def blend_sd_into_reconstruction(
+    reconstruction: np.ndarray,
+    sd_output: np.ndarray,
+    mask: np.ndarray,
+    alpha: float = SD_BLEND_ALPHA,
+) -> np.ndarray:
+    """
+    Blend Stable Diffusion output over the background reconstruction inside
+    the mask region with a feathered edge.
+    """
+    if sd_output is None:
+        return reconstruction
+    if sd_output.shape != reconstruction.shape:
+        sd_output = cv2.resize(
+            sd_output, (reconstruction.shape[1], reconstruction.shape[0])
+        )
+    feathered = feather_mask(mask, ksize=25)[..., None] * alpha
+    blended = (
+        reconstruction.astype(np.float32) * (1.0 - feathered)
+        + sd_output.astype(np.float32) * feathered
+    )
+    return np.clip(blended, 0, 255).astype(np.uint8)
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input", required=True)
-    parser.add_argument("--output", default="result.mp4")
-    parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--debug-dir", default="debug")
-    parser.add_argument("--max-frames", type=int, default=None)
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Remove selected players and reconstruct background."
+    )
+    parser.add_argument("--input", required=True, help="Input video path")
+    parser.add_argument("--output", default="result.mp4", help="Output video path")
+    parser.add_argument("--debug", action="store_true", help="Export frame images instead of video")
+    parser.add_argument("--debug-dir", default="debug", help="Directory for debug frames")
+    parser.add_argument("--max-frames", type=int, default=None, help="Stop after N frames")
     args = parser.parse_args()
 
     selected_ids = load_selection()
@@ -102,7 +153,7 @@ def main():
 
     if args.debug:
         debug_path = prepare_debug_directory(args.debug_dir)
-        print(f"Debug mode: saving up to {args.max_frames or 10} frames → {debug_path}/")
+        print(f"Debug mode: saving up to {args.max_frames or '∞'} frames → {debug_path}/")
     else:
         writer = cv2.VideoWriter(
             args.output,
@@ -114,19 +165,16 @@ def main():
             cap.release()
             raise RuntimeError(f"Cannot create output video: {args.output}")
 
+    # ── Models ──────────────────────────────────────────────────────────────
     detector = PlayerDetector(YOLO_MODEL_NAME, DETECTION_CLASSES)
     tracker  = PlayerTracker()
     sam      = SAMRefiner()
     sd       = SDInpainter()
 
+    # ── Processing components ────────────────────────────────────────────────
     mask_smoother = TemporalMaskSmoother(history=MASK_HISTORY)
     composer      = TemporalRemovalComposer(blend_alpha=0.15, feather_radius=21)
     reconstructor = MotionCompensatedBackgroundReconstructor()
-
-    # Cache the most-recent SD result so we can blend it on non-SD frames
-    # instead of dropping back to raw OpenCV inpainting artifacts.
-    last_sd_output = None
-    last_sd_mask   = None
 
     frame_idx = 0
 
@@ -138,89 +186,88 @@ def main():
         frame_idx += 1
         boxes, detector_masks = detector.detect(frame)
 
-        # ── No detections ──────────────────────────────────────────────
+        # ── No players detected ──────────────────────────────────────────────
         if boxes is None or len(boxes) == 0:
-            # BUG FIX: update reconstructor with the RAW frame (not output)
-            # so genuine background pixels enter the buffer.
+            # Store raw frame with empty mask so the buffer accumulates clean
+            # background even during player-free intervals.
             reconstructor.update(frame, frame, np.zeros(frame.shape[:2], dtype=np.uint8))
             output = frame.copy()
 
-        # ── Players detected ───────────────────────────────────────────
+        # ── Players detected ─────────────────────────────────────────────────
         else:
             tracker.update(boxes)
+
             sam_masks        = sam.refine(frame, boxes)
             selected_indices = tracker.get_detection_indices(selected_ids)
 
             mask = create_player_removal_mask(
-                frame.shape[:2], boxes, sam_masks,
-                selected_indices, auxiliary_masks=detector_masks,
+                frame.shape[:2],
+                boxes,
+                sam_masks,
+                selected_indices,
+                auxiliary_masks=detector_masks,
             )
             mask = stabilize_mask(mask)
             mask = mask_smoother.smooth(mask)
 
             if np.sum(mask) > 0:
-                # ── Step 1: classical inpaint (fast, always-available base) ──
+                # ── Step 1: Classical inpaint ──────────────────────────────
                 mask_clean = cv2.medianBlur((mask * 255).astype(np.uint8), 5)
                 mask255    = (mask_clean > 127).astype(np.uint8) * 255
                 base       = cv2.inpaint(frame, mask255, 4, cv2.INPAINT_TELEA)
 
-                # ── Step 2: background reconstruction from frame buffer ──
-                # BUG FIX: pass `base` (not `frame`) so the reconstructor has
-                # a valid per-pixel fallback for every position, but source
-                # of background data is the clean rolling buffer — not the
-                # artefact-laden output of a previous iteration.
+                # ── Step 2: Motion-compensated background reconstruction ───
+                # reconstruct() fills mask pixels from the homography-aligned
+                # frame buffer, falling back to colour-corrected TELEA base.
                 reconstructed = reconstructor.reconstruct(frame, mask, base)
 
-                # Sanity check: if reconstructed mask region is implausibly
-                # dark (all-black warp padding crept in), fall back to base.
+                # Safety check: implausibly dark output means all-black border
+                # padding leaked through — revert to TELEA base for those pixels.
                 if np.mean(reconstructed[mask > 0]) < 10:
                     reconstructed = base
 
-                # ── Step 3: Stable Diffusion refinement ──────────────────
-                # Run SD on a fixed interval; between SD frames reuse the
-                # cached result so we never display raw OpenCV artefacts.
-                # BUG FIX (original): SD ran every 15 frames but the 14
-                # in-between frames used only OpenCV inpainting, which was
-                # then baked into the background model as "good" background.
+                # ── Step 3: Stable Diffusion refinement ───────────────────
+                # Run SD on a cadence; inject the result back into the
+                # reconstructor buffer (mask=zeros) so future frames reuse it
+                # through homography alignment — no stale blending needed.
                 run_sd = (
                     sd.enabled
-                    and frame_idx % SD_INTERVAL == 0
-                    and np.sum(mask) > SD_MIN_MASK_PIXELS
+                    and (frame_idx % SD_INTERVAL == 0)
+                    and (int(np.sum(mask)) > SD_MIN_MASK_PIXELS)
                 )
 
                 if run_sd:
                     sd_result = sd.inpaint(reconstructed, mask)
                     if sd_result is not None:
-                        last_sd_output = sd_result
-                        last_sd_mask   = mask.copy()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-
-                # Blend SD result (cached or fresh) with the reconstruction
-                if last_sd_output is not None and last_sd_mask is not None:
-                    # Warp the cached SD result into the current mask region
-                    # using a simple alpha blend weighted by mask overlap
-                    overlap = np.minimum(mask.astype(np.float32),
-                                         last_sd_mask.astype(np.float32))
-                    if overlap.sum() > 0:
-                        output = blend_sd_result(reconstructed, last_sd_output,
-                                                 overlap, alpha=SD_BLEND_ALPHA)
+                        # Blend SD result into the reconstruction for this frame
+                        output = blend_sd_into_reconstruction(
+                            reconstructed, sd_result, mask
+                        )
+                        # Inject the blended result as a clean background frame.
+                        # mask=zeros tells the buffer: every pixel here is valid
+                        # background (no players) and may be used by future frames.
+                        reconstructor.inject_clean_frame(output)
                     else:
                         output = reconstructed
+
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                 else:
                     output = reconstructed
 
-                # ── Step 4: temporal smoothing of the final composite ──
+                # ── Step 4: Temporal smoothing ─────────────────────────────
                 output = composer.compose(frame, output, mask)
 
-                # ── Step 5: update background buffer ─────────────────────
-                # BUG FIX: store the RAW frame + its occlusion mask, NOT the
-                # processed output.  Storing `output` fed inpainting artefacts
-                # back into future reconstructions.
+                # ── Step 5: Update background buffer ──────────────────────
+                # Store the RAW frame + its occlusion mask.
+                # The processed `output` is NOT stored — it may contain
+                # residual inpainting artefacts that would corrupt future
+                # reconstructions if fed back as background.
                 reconstructor.update(frame, output, mask)
 
             else:
                 output = frame.copy()
+                # No players this frame → fully clean; store as background.
                 reconstructor.update(frame, frame, mask)
 
         output = normalize_frame(output, width, height)
@@ -230,8 +277,8 @@ def main():
         else:
             writer.write(output)
 
-        percent = frame_idx / total * 100
-        print(f"\rProcessing {percent:5.1f}%  frame {frame_idx}/{total}", end="")
+        pct = frame_idx / total * 100
+        print(f"\rProcessing {pct:5.1f}%  frame {frame_idx}/{total}", end="", flush=True)
 
         if args.debug and args.max_frames and frame_idx >= args.max_frames:
             break
@@ -243,7 +290,7 @@ def main():
     if args.debug:
         print(f"\nDebug frames saved → {debug_path}")
     else:
-        print("\nSaved:", args.output)
+        print(f"\nSaved: {args.output}")
 
 
 if __name__ == "__main__":
