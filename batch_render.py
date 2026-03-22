@@ -1,63 +1,44 @@
 import cv2
 import json
 import argparse
-from pathlib import Path
 import numpy as np
-import torch
 
-from config import YOLO_MODEL_NAME, DETECTION_CLASSES
+from config import *
 from models.detector import PlayerDetector
 from processing.tracker import PlayerTracker
-from processing.effects import (
-    MotionCompensatedBackgroundReconstructor,
-    TemporalMaskSmoother,
-    TemporalRemovalComposer,
-    create_player_removal_mask,
-    stabilize_mask,
-    feather_mask,
-)
+from processing.effects import create_player_removal_mask
 from processing.sd_inpainting import SDInpainter
 
-# ---------------------------------------------------------------------------
-# Constants (UPDATED FOR DEBUG)
-# ---------------------------------------------------------------------------
 
-SD_BLEND_ALPHA = 0.6
-SD_INTERVAL = 2
-SD_MIN_MASK_PX = 100
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def load_selection() -> set:
-    path = Path("selection.json")
-    if not path.exists():
-        raise FileNotFoundError("selection.json not found.")
-    with path.open("r") as f:
+def load_selection():
+    with open("selection.json", "r") as f:
         return set(json.load(f)["selected_ids"])
 
 
-def blend_sd_result(base, sd_output, mask, alpha=SD_BLEND_ALPHA):
-    if sd_output is None:
-        return base
-
-    if sd_output.shape != base.shape:
-        sd_output = cv2.resize(sd_output, (base.shape[1], base.shape[0]))
-
-    feathered = feather_mask(mask, ksize=31)[..., None] * alpha
-
-    result = (
-        base.astype(np.float32) * (1.0 - feathered)
-        + sd_output.astype(np.float32) * feathered
-    )
-
-    return np.clip(result, 0, 255).astype(np.uint8)
+def smooth_mask(mask):
+    mask = cv2.dilate(mask, np.ones((5, 5), np.uint8), 1)
+    mask = cv2.GaussianBlur(mask, (15, 15), 0)
+    return (mask > 0.25).astype(np.uint8)
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+def resize_for_sd(frame, mask, size=256):
+    h, w = frame.shape[:2]
+    frame_small = cv2.resize(frame, (size, size))
+    mask_small = cv2.resize(mask, (size, size))
+    return frame_small, mask_small, (w, h)
+
+
+def upscale_back(frame_small, orig_size):
+    return cv2.resize(frame_small, orig_size)
+
+
+def blend_edges(original, generated, mask):
+    """
+    Feather blend to avoid SD seams
+    """
+    mask_f = cv2.GaussianBlur(mask.astype(np.float32), (31, 31), 0)[..., None]
+    return (generated * mask_f + original * (1 - mask_f)).astype(np.uint8)
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -68,8 +49,6 @@ def main():
     selected_ids = load_selection()
 
     cap = cv2.VideoCapture(args.input)
-    if not cap.isOpened():
-        raise RuntimeError(f"Cannot open input video: {args.input}")
 
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -79,17 +58,14 @@ def main():
         args.output,
         cv2.VideoWriter_fourcc(*"mp4v"),
         fps,
-        (width, height),
+        (width, height)
     )
 
     detector = PlayerDetector(YOLO_MODEL_NAME, DETECTION_CLASSES)
     tracker = PlayerTracker()
     sd = SDInpainter()
 
-    mask_smoother = TemporalMaskSmoother(history=5)
-    composer = TemporalRemovalComposer(blend_alpha=0.15, feather_radius=21)
-    reconstructor = MotionCompensatedBackgroundReconstructor()
-
+    prev_output = None
     frame_idx = 0
 
     while True:
@@ -98,14 +74,10 @@ def main():
             break
 
         frame_idx += 1
-        boxes, detector_masks = detector.detect(frame)
+
+        boxes, masks = detector.detect(frame)
 
         if boxes is None or len(boxes) == 0:
-            reconstructor.update(
-                frame,
-                frame,
-                np.zeros(frame.shape[:2], dtype=np.uint8)
-            )
             writer.write(frame)
             continue
 
@@ -115,59 +87,40 @@ def main():
         mask = create_player_removal_mask(
             frame.shape[:2],
             boxes,
-            None,
-            selected_indices,
-            auxiliary_masks=detector_masks,
+            masks,
+            selected_indices
         )
 
-        mask = stabilize_mask(mask)
-        mask = mask_smoother.smooth(mask)
+        mask = smooth_mask(mask)
 
         if np.sum(mask) > 0:
+            small_frame, small_mask, orig_size = resize_for_sd(frame, mask)
 
-            # Clean mask
-            mask_clean = cv2.medianBlur((mask * 255).astype(np.uint8), 5)
-            mask255 = (mask_clean > 127).astype(np.uint8) * 255
+            sd_out_small = sd.inpaint(small_frame, small_mask)
 
-            # Base inpaint
-            base = cv2.inpaint(frame, mask255, 4, cv2.INPAINT_TELEA)
+            if sd_out_small is not None:
+                sd_out = upscale_back(sd_out_small, orig_size)
 
-            # Reconstruction (still used as structure)
-            reconstructed = reconstructor.reconstruct(frame, mask, base)
-
-            if np.mean(reconstructed[mask > 0]) < 5:
-                reconstructed = base
-
-            # 🔥 FORCE SD (isolation test)
-            run_sd = True
-
-            if run_sd:
-                sd_result = sd.inpaint(reconstructed, mask)
-
-                if sd_result is not None:
-                    output = blend_sd_result(reconstructed, sd_result, mask)
-                    reconstructor.inject_clean_frame(output)
-                else:
-                    output = reconstructed
-
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                # 🔥 Key: blend instead of full replace
+                output = blend_edges(frame, sd_out, mask)
             else:
-                output = reconstructed
-
-            output = composer.compose(frame, output, mask)
-            reconstructor.update(frame, output, mask)
-
+                output = frame.copy()
         else:
             output = frame.copy()
-            reconstructor.update(frame, frame, mask)
+
+        # 🔥 Reduced temporal smoothing (less ghosting)
+        if prev_output is not None:
+            output = cv2.addWeighted(prev_output, 0.4, output, 0.6, 0)
+
+        prev_output = output.copy()
 
         writer.write(output.astype(np.uint8))
-        print(f"\rFrame {frame_idx}", end="", flush=True)
+        print(f"\rFrame {frame_idx}", end="")
 
     cap.release()
     writer.release()
-    print(f"\nSaved: {args.output}")
+
+    print("\nSaved:", args.output)
 
 
 if __name__ == "__main__":
