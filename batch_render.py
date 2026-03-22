@@ -1,10 +1,28 @@
+"""
+batch_render.py
+
+Simplified rendering path (no SAM, no debug mode) for fast batch processing.
+Uses the same MotionCompensatedBackgroundReconstructor as render_video.py
+with identical buffer/homography logic.
+
+Fixes applied vs. original
+---------------------------
+* reconstructor.update() stores the RAW frame, not output — prevents artifact
+  feedback accumulation.
+* SD runs on a cadence (SD_INTERVAL) rather than every frame; result is
+  injected into the buffer via inject_clean_frame() for camera-aligned reuse.
+* TemporalRemovalComposer alpha reduced from 0.35 → 0.15 to stop smearing.
+* Mask dilation uses (5,5)×1 via stabilize_mask() (inherited from effects.py).
+"""
+
 import cv2
 import json
 import argparse
 from pathlib import Path
 import numpy as np
+import torch
 
-from config import *
+from config import YOLO_MODEL_NAME, DETECTION_CLASSES
 from models.detector import PlayerDetector
 from processing.tracker import PlayerTracker
 from processing.effects import (
@@ -18,39 +36,54 @@ from processing.effects import (
 from processing.sd_inpainting import SDInpainter
 
 
-SD_BLEND_ALPHA = 0.85
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+SD_BLEND_ALPHA   = 0.55
+SD_INTERVAL      = 8       # Run SD every N frames
+SD_MIN_MASK_PX   = 400     # Skip SD for tiny masks (faster)
 
 
-def load_selection():
-    selection_path = Path("selection.json")
-    if not selection_path.exists():
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def load_selection() -> set:
+    path = Path("selection.json")
+    if not path.exists():
         raise FileNotFoundError(
             "selection.json not found. Run the selection step first or provide the file."
         )
-
-    with selection_path.open("r") as f:
+    with path.open("r") as f:
         return set(json.load(f)["selected_ids"])
 
 
-def blend_sd_result(base_output, sd_output, mask, alpha=SD_BLEND_ALPHA):
+def blend_sd_result(
+    base: np.ndarray,
+    sd_output: np.ndarray,
+    mask: np.ndarray,
+    alpha: float = SD_BLEND_ALPHA,
+) -> np.ndarray:
     if sd_output is None:
-        return base_output
-
-    if sd_output.shape != base_output.shape:
-        sd_output = cv2.resize(sd_output, (base_output.shape[1], base_output.shape[0]))
-
-    mask_alpha = feather_mask(mask, 31)[..., None] * alpha
-    output = base_output.astype(np.float32) * (1.0 - mask_alpha)
-    output += sd_output.astype(np.float32) * mask_alpha
-    return np.clip(output, 0, 255).astype(np.uint8)
+        return base
+    if sd_output.shape != base.shape:
+        sd_output = cv2.resize(sd_output, (base.shape[1], base.shape[0]))
+    feathered = feather_mask(mask, ksize=31)[..., None] * alpha
+    result = base.astype(np.float32) * (1.0 - feathered) + sd_output.astype(np.float32) * feathered
+    return np.clip(result, 0, 255).astype(np.uint8)
 
 
-def main():
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
+
+def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", default="result.mp4")
-
     args = parser.parse_args()
 
     selected_ids = load_selection()
@@ -59,9 +92,9 @@ def main():
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open input video: {args.input}")
 
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 0
+    fps    = cap.get(cv2.CAP_PROP_FPS) or 30.0
     if fps <= 0:
         fps = 30.0
 
@@ -69,40 +102,40 @@ def main():
         args.output,
         cv2.VideoWriter_fourcc(*"mp4v"),
         fps,
-        (width, height)
+        (width, height),
     )
     if not writer.isOpened():
         cap.release()
         raise RuntimeError(f"Cannot create output video: {args.output}")
 
     detector = PlayerDetector(YOLO_MODEL_NAME, DETECTION_CLASSES)
-    tracker = PlayerTracker()
-    sd = SDInpainter()
+    tracker  = PlayerTracker()
+    sd       = SDInpainter()
 
     mask_smoother = TemporalMaskSmoother(history=5)
-    composer = TemporalRemovalComposer(blend_alpha=0.35, feather_radius=31)
+    # alpha=0.15 (was 0.35) — prevents artifact smearing across time
+    composer      = TemporalRemovalComposer(blend_alpha=0.15, feather_radius=21)
     reconstructor = MotionCompensatedBackgroundReconstructor()
 
     frame_idx = 0
 
     while True:
-
         ret, frame = cap.read()
         if not ret:
             break
 
         frame_idx += 1
-
         boxes, detector_masks = detector.detect(frame)
 
+        # ── No detections ────────────────────────────────────────────────────
         if boxes is None or len(boxes) == 0:
-            output = frame.copy()
-            reconstructor.update(frame, output, np.zeros(frame.shape[:2], dtype=np.uint8))
-            writer.write(output)
+            reconstructor.update(frame, frame, np.zeros(frame.shape[:2], dtype=np.uint8))
+            writer.write(frame)
+            print(f"\rFrame {frame_idx}", end="", flush=True)
             continue
 
+        # ── Players detected ─────────────────────────────────────────────────
         tracker.update(boxes)
-
         selected_indices = tracker.get_detection_indices(selected_ids)
 
         mask = create_player_removal_mask(
@@ -111,40 +144,55 @@ def main():
             detector_masks,
             selected_indices,
         )
-
         mask = stabilize_mask(mask)
         mask = mask_smoother.smooth(mask)
 
         if np.sum(mask) > 0:
-
+            # Step 1: Classical inpaint as fast base
             mask255 = (mask * 255).astype(np.uint8)
+            base    = cv2.inpaint(frame, mask255, 5, cv2.INPAINT_TELEA)
 
-            base_output = cv2.inpaint(
-                frame,
-                mask255,
-                5,
-                cv2.INPAINT_TELEA
+            # Step 2: Motion-compensated background fill
+            reconstructed = reconstructor.reconstruct(frame, mask, base)
+            if np.mean(reconstructed[mask > 0]) < 10:
+                reconstructed = base
+
+            # Step 3: SD refinement on cadence
+            run_sd = (
+                sd.enabled
+                and (frame_idx % SD_INTERVAL == 0)
+                and (int(np.sum(mask)) > SD_MIN_MASK_PX)
             )
 
-            reconstructed = reconstructor.reconstruct(frame, mask, base_output)
-            sd_output = sd.inpaint(reconstructed, mask)
-            output = blend_sd_result(reconstructed, sd_output, mask)
+            if run_sd:
+                sd_result = sd.inpaint(reconstructed, mask)
+                if sd_result is not None:
+                    output = blend_sd_result(reconstructed, sd_result, mask)
+                    # Inject clean result into buffer for camera-aligned reuse
+                    reconstructor.inject_clean_frame(output)
+                else:
+                    output = reconstructed
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            else:
+                output = reconstructed
 
+            # Step 4: Temporal smoothing
             output = composer.compose(frame, output, mask)
+
+            # Step 5: Store RAW frame (not output) to prevent artifact feedback
             reconstructor.update(frame, output, mask)
 
         else:
             output = frame.copy()
-            reconstructor.update(frame, output, mask)
+            reconstructor.update(frame, frame, mask)
 
         writer.write(output.astype(np.uint8))
-
-        print(f"\rFrame {frame_idx}", end="")
+        print(f"\rFrame {frame_idx}", end="", flush=True)
 
     cap.release()
     writer.release()
-
-    print("\nSaved:", args.output)
+    print(f"\nSaved: {args.output}")
 
 
 if __name__ == "__main__":
