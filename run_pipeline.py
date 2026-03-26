@@ -2,8 +2,8 @@ import subprocess
 import argparse
 import os
 import shutil
+import sys
 from pathlib import Path
-
 
 NORMAL_MODE = "normal"
 DEBUG_MODE = "debug"
@@ -54,11 +54,14 @@ def ensure_selection_exists(selection_path="selection.json"):
         )
 
 
+# --------------------------------------------------
+# STEP 1: Selection
+# --------------------------------------------------
 def run_selection(input_video):
     print("\n[STEP 1] Player Selection\n")
 
     cmd = [
-        "python",
+        sys.executable,
         "main.py",
         "--input",
         input_video
@@ -70,6 +73,9 @@ def run_selection(input_video):
         raise RuntimeError("selection.json not created. Selection step failed.")
 
 
+# --------------------------------------------------
+# STEP 2: Rendering (UPDATED)
+# --------------------------------------------------
 def build_render_command(
     input_video,
     output_video,
@@ -78,19 +84,17 @@ def build_render_command(
     max_frames=DEBUG_FRAME_LIMIT,
 ):
     cmd = [
-        "python",
-        "render_video.py",
+        sys.executable,
+        "batch_render.py",   # switched from render_video.py
         "--input",
         input_video,
         "--output",
         output_video
     ]
 
+    # Optional debug flags (only if you later support them)
     if debug:
         cmd.extend([
-            "--debug",
-            "--debug-dir",
-            str(debug_dir),
             "--max-frames",
             str(max_frames),
         ])
@@ -118,6 +122,9 @@ def run_render(
     subprocess.run(cmd, check=True)
 
 
+# --------------------------------------------------
+# MAIN
+# --------------------------------------------------
 def main():
 
     parser = argparse.ArgumentParser()
@@ -130,10 +137,16 @@ def main():
     args = parser.parse_args()
     mode = resolve_run_mode(args.mode)
 
+    # ---------------- DEBUG MODE ----------------
     if mode == DEBUG_MODE:
         ensure_selection_exists()
         debug_path = prepare_debug_directory(DEBUG_DIR)
-        print(f"Debug mode enabled: using existing selection.json and saving 10 frames to {debug_path}/")
+
+        print(
+            f"Debug mode enabled: using existing selection.json "
+            f"and saving {DEBUG_FRAME_LIMIT} frames to {debug_path}/"
+        )
+
         run_render(
             args.input,
             args.output,
@@ -141,9 +154,11 @@ def main():
             debug_dir=debug_path,
             max_frames=DEBUG_FRAME_LIMIT,
         )
+
         print(f"\nDebug run complete → {debug_path}/")
         return
 
+    # ---------------- NORMAL MODE ----------------
     if not args.skip_selection:
         run_selection(args.input)
     else:

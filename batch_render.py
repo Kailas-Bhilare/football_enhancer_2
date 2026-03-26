@@ -7,7 +7,11 @@ from config import *
 from models.detector import PlayerDetector
 from processing.tracker import PlayerTracker
 from processing.effects import create_player_removal_mask
+from processing.sam_refiner import SAMRefiner
 from processing.sd_inpainting import SDInpainter
+
+# lower interval = less flicker, more SD usage
+SD_INTERVAL = 4
 
 
 def load_selection():
@@ -15,36 +19,43 @@ def load_selection():
         return set(json.load(f)["selected_ids"])
 
 
-def smooth_mask(mask):
-    # Less aggressive smoothing (prevents eating background)
-    mask = cv2.GaussianBlur(mask.astype(np.float32), (11, 11), 0)
-    return (mask > 0.3).astype(np.uint8)
+# --------------------------------------------------
+# EDGE BLENDING (FIXED)
+# --------------------------------------------------
+def blend_edge(original, generated, mask):
+    mask = (mask > 0).astype(np.uint8)
+
+    # bigger core = full removal
+    core = cv2.erode(mask, np.ones((11, 11), np.uint8), 1)
+
+    edge = mask - core
+
+    edge = cv2.GaussianBlur(edge.astype(np.float32), (15, 15), 0)
+    edge = edge[..., None]
+
+    out = original.copy()
+
+    # hard replace center
+    out[core > 0] = generated[core > 0]
+
+    # soft edge blend
+    out = (
+        generated.astype(np.float32) * edge +
+        out.astype(np.float32) * (1 - edge)
+    ).astype(np.uint8)
+
+    return out
 
 
-def resize_for_sd(frame, mask, size=256):
-    h, w = frame.shape[:2]
-    frame_small = cv2.resize(frame, (size, size))
-    mask_small = cv2.resize(mask, (size, size))
-    return frame_small, mask_small, (w, h)
-
-
-def upscale_back(frame_small, orig_size):
-    return cv2.resize(frame_small, orig_size)
-
-
-def blend_edges(original, generated, mask):
-    """
-    Feather blend to remove SD seams and artifacts
-    """
-    mask_f = cv2.GaussianBlur(mask.astype(np.float32), (31, 31), 0)[..., None]
-    blended = generated * mask_f + original * (1 - mask_f)
-    return np.clip(blended, 0, 255).astype(np.uint8)
-
-
+# --------------------------------------------------
+# MAIN
+# --------------------------------------------------
 def main():
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", default="result.mp4")
+
     args = parser.parse_args()
 
     selected_ids = load_selection()
@@ -64,59 +75,71 @@ def main():
 
     detector = PlayerDetector(YOLO_MODEL_NAME, DETECTION_CLASSES)
     tracker = PlayerTracker()
+    sam = SAMRefiner()
     sd = SDInpainter()
 
-    prev_output = None
+    prev_clean = None
     frame_idx = 0
 
     while True:
+
         ret, frame = cap.read()
         if not ret:
             break
 
         frame_idx += 1
 
-        boxes, masks = detector.detect(frame)
+        boxes, det_masks = detector.detect(frame)
 
         if boxes is None or len(boxes) == 0:
             writer.write(frame)
+            prev_clean = frame.copy()
             continue
 
         tracker.update(boxes)
-
         selected_indices = tracker.get_detection_indices(selected_ids)
+
+        sam_masks = sam.refine(frame, boxes)
+        if sam_masks is None:
+            sam_masks = det_masks
 
         mask = create_player_removal_mask(
             frame.shape[:2],
             boxes,
-            masks,
-            selected_indices
+            sam_masks,
+            selected_indices,
+            auxiliary_masks=det_masks,
         )
 
-        mask = smooth_mask(mask)
+        # IMPORTANT: expand mask to fully cover players
+        mask = cv2.dilate(mask, np.ones((7, 7), np.uint8), 1)
 
-        if np.sum(mask) > 0:
-            small_frame, small_mask, orig_size = resize_for_sd(frame, mask)
+        if np.sum(mask) == 0:
+            writer.write(frame)
+            prev_clean = frame.copy()
+            continue
 
-            output_small = sd.inpaint(small_frame, small_mask)
+        # -----------------------------
+        # TEMPORAL BASE
+        # -----------------------------
+        base = prev_clean.copy() if prev_clean is not None else frame.copy()
 
-            if output_small is not None:
-                sd_up = upscale_back(output_small, orig_size)
+        # -----------------------------
+        # SD PASS (INTERVAL)
+        # -----------------------------
+        if frame_idx % SD_INTERVAL == 0:
+            sd_out = sd.inpaint(frame, mask)
 
-                # 🔥 Key fix: blend instead of replace
-                output = blend_edges(frame, sd_up, mask)
+            if sd_out is not None:
+                clean = blend_edge(frame, sd_out, mask)
             else:
-                output = frame.copy()
+                clean = base
         else:
-            output = frame.copy()
+            clean = base
 
-        # Temporal smoothing
-        if prev_output is not None:
-            output = cv2.addWeighted(prev_output, 0.7, output, 0.3, 0)
+        prev_clean = clean.copy()
 
-        prev_output = output.copy()
-
-        writer.write(output.astype(np.uint8))
+        writer.write(clean.astype(np.uint8))
 
         print(f"\rFrame {frame_idx}", end="")
 
