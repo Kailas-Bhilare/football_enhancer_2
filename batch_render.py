@@ -16,7 +16,7 @@ def load_selection():
 
 
 # -------------------------
-# HOMOGRAPHY (better than optical flow)
+# HOMOGRAPHY (stable camera motion)
 # -------------------------
 def warp_previous(prev, curr):
     prev_gray = cv2.cvtColor(prev, cv2.COLOR_BGR2GRAY)
@@ -43,30 +43,52 @@ def warp_previous(prev, curr):
         return prev
 
     h, w = prev.shape[:2]
-    warped = cv2.warpPerspective(prev, H, (w, h))
-
-    return warped
+    return cv2.warpPerspective(prev, H, (w, h))
 
 
 # -------------------------
-# IMPROVED BLENDING
+# MASK REFINEMENT (fix gaps)
+# -------------------------
+def refine_mask(mask):
+    mask = (mask > 0).astype(np.uint8)
+
+    kernel = np.ones((5, 5), np.uint8)
+
+    # fill gaps between limbs
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    # slight expansion
+    mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), 1)
+
+    return mask
+
+
+# -------------------------
+# CLEAN EDGE BLENDING
 # -------------------------
 def blend_edge(original, generated, mask):
 
     mask = (mask > 0).astype(np.uint8)
 
-    core = cv2.erode(mask, np.ones((15, 15), np.uint8), 1)
+    core = cv2.erode(mask, np.ones((13, 13), np.uint8), 1)
     edge = mask - core
 
-    edge = cv2.GaussianBlur(edge.astype(np.float32), (9, 9), 0)
-    edge = np.clip(edge, 0, 1)[..., None]
+    # distance-based blending (cleaner than blur)
+    dist = cv2.distanceTransform(mask, cv2.DIST_L2, 3)
+    alpha = np.clip(dist / 5.0, 0, 1)
+
+    alpha = alpha * edge
+    alpha = alpha[..., None]
 
     out = original.copy()
+
+    # hard replace center
     out[core > 0] = generated[core > 0]
 
+    # blend only edges
     out = (
-        generated.astype(np.float32) * edge +
-        out.astype(np.float32) * (1 - edge)
+        generated.astype(np.float32) * alpha +
+        out.astype(np.float32) * (1 - alpha)
     )
 
     return np.clip(out, 0, 255).astype(np.uint8)
@@ -137,6 +159,7 @@ def main():
 
         output = frame.copy()
 
+        # process big players first
         selected_indices = sorted(
             selected_indices,
             key=lambda i: player_area(boxes[i]),
@@ -157,9 +180,8 @@ def main():
                     interpolation=cv2.INTER_NEAREST,
                 )
 
-            # mask cleanup
-            player_mask = cv2.medianBlur(player_mask, 5)
-            player_mask = cv2.dilate(player_mask, np.ones((3, 3), np.uint8), 1)
+            # improved mask
+            player_mask = refine_mask(player_mask)
 
             if np.count_nonzero(player_mask) == 0:
                 continue
@@ -171,8 +193,8 @@ def main():
                 fill = warped.copy()
                 fill[player_mask > 0] = warped[player_mask > 0]
 
-                # reduced SD usage
-                if np.mean(fill[player_mask > 0]) < 15:
+                # less SD usage
+                if np.mean(fill[player_mask > 0]) < 25:
 
                     sd_out = sd.inpaint(output, player_mask)
 
@@ -190,7 +212,9 @@ def main():
                 if sd_out is not None:
                     output = blend_edge(output, sd_out, player_mask)
 
-        # subtle noise for realism
+        # subtle realism polish
+        output = cv2.bilateralFilter(output, 5, 20, 20)
+
         noise = np.random.normal(0, 2, output.shape).astype(np.int16)
         output = np.clip(output.astype(np.int16) + noise, 0, 255).astype(np.uint8)
 
