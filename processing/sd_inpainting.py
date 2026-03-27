@@ -5,11 +5,10 @@ from PIL import Image
 
 
 class SDInpainter:
-
     def __init__(
         self,
-        target_size=512,
-        pad_px=48,
+        target_size=448,
+        pad_px=40,
         prompt="empty football pitch grass, professional stadium broadcast view, clean natural grass texture, consistent mowing pattern, sharp white field lines, realistic lighting, no players",
         negative_prompt="players, people, athlete, distorted lines, duplicate lines, warped markings, blurry, smudged, artifacts, patchy grass, noise, watermark, text",
         seed_from_position=True,
@@ -86,8 +85,24 @@ class SDInpainter:
         else:
             bw = bh = 0
 
-        # Quantized, location-based seed to reduce frame-to-frame randomness.
-        return int((cx // 16) * 1000003 + (cy // 16) * 10007 + (bw // 16) * 101 + (bh // 16)) % (2**31)
+        return int(
+            (cx // 16) * 1000003
+            + (cy // 16) * 10007
+            + (bw // 16) * 101
+            + (bh // 16)
+        ) % (2**31)
+
+    def _looks_bad(self, crop, result, mask_resized):
+        known = mask_resized == 0
+        if np.count_nonzero(known) < 100:
+            return False
+
+        diff = np.mean(
+            np.abs(
+                crop[known].astype(np.int16) - result[known].astype(np.int16)
+            )
+        )
+        return diff > 35
 
     def inpaint(self, frame, mask):
         if not self.enabled or self.pipe is None:
@@ -108,11 +123,14 @@ class SDInpainter:
 
         h, w = crop.shape[:2]
 
-        # Stronger mask expansion so the player is fully removed.
         mask_dilated = cv2.dilate(mask_crop, np.ones((9, 9), np.uint8), 2)
 
         img = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-        img = cv2.resize(img, (self.target_size, self.target_size), interpolation=cv2.INTER_CUBIC)
+        img = cv2.resize(
+            img,
+            (self.target_size, self.target_size),
+            interpolation=cv2.INTER_CUBIC,
+        )
 
         mask_resized = cv2.resize(
             mask_dilated,
@@ -126,19 +144,46 @@ class SDInpainter:
         seed = self._make_seed(mask_crop, bbox=bbox)
         generator = torch.Generator().manual_seed(seed) if seed is not None else None
 
-        result = self.pipe(
-            prompt=self.prompt,
-            negative_prompt=self.negative_prompt,
-            image=image,
-            mask_image=mask_img,
-            generator=generator,
-            guidance_scale=7.5,
-            num_inference_steps=28,
-            strength=0.9,
-        ).images[0]
+        try:
+            result = self.pipe(
+                prompt=self.prompt,
+                negative_prompt=self.negative_prompt,
+                image=image,
+                mask_image=mask_img,
+                generator=generator,
+                guidance_scale=7.5,
+                num_inference_steps=24,
+                strength=0.88,
+            ).images[0]
+        except Exception as exc:
+            print(f"SD inference failed ({exc}); using TELEA fallback.")
+            fallback = cv2.inpaint(
+                crop,
+                (mask_dilated * 255).astype(np.uint8),
+                3,
+                cv2.INPAINT_TELEA,
+            )
+            output = frame.copy()
+            output[y1:y2, x1:x2] = fallback
+            return output
 
         result = cv2.cvtColor(np.array(result), cv2.COLOR_RGB2BGR)
         result = cv2.resize(result, (w, h), interpolation=cv2.INTER_CUBIC)
+
+        mask_big = cv2.resize(
+            mask_dilated,
+            (w, h),
+            interpolation=cv2.INTER_NEAREST,
+        ).astype(np.uint8)
+
+        if self._looks_bad(crop, result, mask_big):
+            fallback = cv2.inpaint(
+                crop,
+                (mask_dilated * 255).astype(np.uint8),
+                3,
+                cv2.INPAINT_TELEA,
+            )
+            result = fallback
 
         output = frame.copy()
         output[y1:y2, x1:x2] = result
