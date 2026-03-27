@@ -10,24 +10,21 @@ from processing.effects import create_player_removal_mask
 from processing.sam_refiner import SAMRefiner
 from processing.sd_inpainting import SDInpainter
 
-# lower interval = less flicker, more SD usage
-SD_INTERVAL = 4
-
 
 def load_selection():
     with open("selection.json", "r") as f:
         return set(json.load(f)["selected_ids"])
 
 
-# --------------------------------------------------
-# EDGE BLENDING (FIXED)
-# --------------------------------------------------
+# ---------------------------------------
+# EDGE BLENDING (clean + stable)
+# ---------------------------------------
+
 def blend_edge(original, generated, mask):
     mask = (mask > 0).astype(np.uint8)
 
-    # bigger core = full removal
+    # strong core removal
     core = cv2.erode(mask, np.ones((11, 11), np.uint8), 1)
-
     edge = mask - core
 
     edge = cv2.GaussianBlur(edge.astype(np.float32), (15, 15), 0)
@@ -38,24 +35,24 @@ def blend_edge(original, generated, mask):
     # hard replace center
     out[core > 0] = generated[core > 0]
 
-    # soft edge blend
+    # soft edges
     out = (
         generated.astype(np.float32) * edge +
         out.astype(np.float32) * (1 - edge)
-    ).astype(np.uint8)
+    )
 
-    return out
+    return np.clip(out, 0, 255).astype(np.uint8)
 
 
-# --------------------------------------------------
+# ---------------------------------------
 # MAIN
-# --------------------------------------------------
+# ---------------------------------------
+
 def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", default="result.mp4")
-
     args = parser.parse_args()
 
     selected_ids = load_selection()
@@ -78,7 +75,6 @@ def main():
     sam = SAMRefiner()
     sd = SDInpainter()
 
-    prev_clean = None
     frame_idx = 0
 
     while True:
@@ -93,11 +89,18 @@ def main():
 
         if boxes is None or len(boxes) == 0:
             writer.write(frame)
-            prev_clean = frame.copy()
             continue
 
         tracker.update(boxes)
         selected_indices = tracker.get_detection_indices(selected_ids)
+
+        if not selected_indices:
+            writer.write(frame)
+            continue
+
+        # -------------------------
+        # SAM MASK
+        # -------------------------
 
         sam_masks = sam.refine(frame, boxes)
         if sam_masks is None:
@@ -111,35 +114,25 @@ def main():
             auxiliary_masks=det_masks,
         )
 
-        # IMPORTANT: expand mask to fully cover players
+        # 🔥 expand mask (critical)
         mask = cv2.dilate(mask, np.ones((7, 7), np.uint8), 1)
 
         if np.sum(mask) == 0:
             writer.write(frame)
-            prev_clean = frame.copy()
             continue
 
-        # -----------------------------
-        # TEMPORAL BASE
-        # -----------------------------
-        base = prev_clean.copy() if prev_clean is not None else frame.copy()
+        # -------------------------
+        # SD PER FRAME (stable)
+        # -------------------------
 
-        # -----------------------------
-        # SD PASS (INTERVAL)
-        # -----------------------------
-        if frame_idx % SD_INTERVAL == 0:
-            sd_out = sd.inpaint(frame, mask)
+        sd_out = sd.inpaint(frame, mask)
 
-            if sd_out is not None:
-                clean = blend_edge(frame, sd_out, mask)
-            else:
-                clean = base
+        if sd_out is None:
+            output = frame.copy()
         else:
-            clean = base
+            output = blend_edge(frame, sd_out, mask)
 
-        prev_clean = clean.copy()
-
-        writer.write(clean.astype(np.uint8))
+        writer.write(output.astype(np.uint8))
 
         print(f"\rFrame {frame_idx}", end="")
 

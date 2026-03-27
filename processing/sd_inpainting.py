@@ -10,8 +10,8 @@ class SDInpainter:
         self,
         target_size=512,
         pad_px=48,
-        prompt="empty football pitch grass, professional stadium broadcast view, clean natural grass texture, consistent mowing pattern, sharp white field lines, realistic lighting, no players, no shadows of people, high detail, natural color, smooth grass surface",
-        negative_prompt="players, people, athlete, distorted lines, duplicate lines, warped markings, blurry, smudged, artifacts, patchy grass, noise, watermark, text",
+        prompt="empty football pitch grass, clean natural texture, realistic field lines, no players",
+        negative_prompt="players, people, artifacts, distortion, blurry",
     ):
         self.target_size = target_size
         self.pad_px = pad_px
@@ -38,7 +38,7 @@ class SDInpainter:
         self.enabled = True
         print("SD ready")
 
-    # --------------------------------------------------
+    # -------------------------
 
     def _bbox(self, mask, shape):
         ys, xs = np.where(mask > 0)
@@ -54,7 +54,7 @@ class SDInpainter:
 
         return x1, y1, x2, y2
 
-    # --------------------------------------------------
+    # -------------------------
 
     def inpaint(self, frame, mask):
 
@@ -74,18 +74,23 @@ class SDInpainter:
 
         h, w = crop.shape[:2]
 
-        # 🔥 EXPAND MASK for full removal
+        # stronger mask = better removal
         mask_dilated = cv2.dilate(mask_crop, np.ones((9, 9), np.uint8), 2)
 
-        # resize
+        # resize to SD resolution
         img = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
         img = cv2.resize(img, (self.target_size, self.target_size))
 
-        mask_resized = cv2.resize(mask_dilated, (self.target_size, self.target_size))
+        mask_resized = cv2.resize(
+            mask_dilated,
+            (self.target_size, self.target_size),
+            interpolation=cv2.INTER_NEAREST
+        )
 
         image = Image.fromarray(img)
         mask_img = Image.fromarray((mask_resized * 255).astype(np.uint8))
 
+        # pure inpainting
         result = self.pipe(
             prompt=self.prompt,
             negative_prompt=self.negative_prompt,
