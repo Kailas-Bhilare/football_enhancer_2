@@ -15,62 +15,58 @@ def load_selection():
         return set(json.load(f)["selected_ids"])
 
 
+# -------------------------
+# HOMOGRAPHY (better than optical flow)
+# -------------------------
 def warp_previous(prev, curr):
     prev_gray = cv2.cvtColor(prev, cv2.COLOR_BGR2GRAY)
     curr_gray = cv2.cvtColor(curr, cv2.COLOR_BGR2GRAY)
 
-    flow = cv2.calcOpticalFlowFarneback(
-        prev_gray,
-        curr_gray,
-        None,
-        0.5,
-        3,
-        15,
-        3,
-        5,
-        1.2,
-        0,
+    pts_prev = cv2.goodFeaturesToTrack(prev_gray, 2000, 0.01, 7)
+
+    if pts_prev is None:
+        return prev
+
+    pts_curr, status, _ = cv2.calcOpticalFlowPyrLK(
+        prev_gray, curr_gray, pts_prev, None
     )
 
-    h, w = flow.shape[:2]
-    grid_x, grid_y = np.meshgrid(np.arange(w), np.arange(h))
+    pts_prev = pts_prev[status == 1]
+    pts_curr = pts_curr[status == 1]
 
-    map_x = (grid_x + flow[..., 0]).astype(np.float32)
-    map_y = (grid_y + flow[..., 1]).astype(np.float32)
+    if len(pts_prev) < 10:
+        return prev
 
-    return cv2.remap(prev, map_x, map_y, cv2.INTER_LINEAR)
+    H, _ = cv2.findHomography(pts_prev, pts_curr, cv2.RANSAC, 5.0)
+
+    if H is None:
+        return prev
+
+    h, w = prev.shape[:2]
+    warped = cv2.warpPerspective(prev, H, (w, h))
+
+    return warped
 
 
+# -------------------------
+# IMPROVED BLENDING
+# -------------------------
 def blend_edge(original, generated, mask):
+
     mask = (mask > 0).astype(np.uint8)
 
-    if generated.shape[:2] != original.shape[:2]:
-        generated = cv2.resize(
-            generated,
-            (original.shape[1], original.shape[0]),
-            interpolation=cv2.INTER_CUBIC,
-        )
+    core = cv2.erode(mask, np.ones((15, 15), np.uint8), 1)
+    edge = mask - core
 
-    # Hard center replacement.
-    core = cv2.erode(mask, np.ones((13, 13), np.uint8), 1)
-
-    # Only blend the boundary band.
-    edge = (mask - core).astype(np.uint8)
-
-    # Distance-based falloff gives cleaner edges than a plain blur.
-    dist = cv2.distanceTransform(mask, cv2.DIST_L2, 3)
-    edge_alpha = np.clip((dist - 1.5) / 6.0, 0.0, 1.0)
-
-    # Keep the alpha focused near the border.
-    edge_alpha = np.maximum(edge_alpha, edge.astype(np.float32))
-    edge_alpha = np.clip(edge_alpha, 0.0, 1.0)[..., None]
+    edge = cv2.GaussianBlur(edge.astype(np.float32), (9, 9), 0)
+    edge = np.clip(edge, 0, 1)[..., None]
 
     out = original.copy()
     out[core > 0] = generated[core > 0]
 
     out = (
-        generated.astype(np.float32) * edge_alpha
-        + out.astype(np.float32) * (1.0 - edge_alpha)
+        generated.astype(np.float32) * edge +
+        out.astype(np.float32) * (1 - edge)
     )
 
     return np.clip(out, 0, 255).astype(np.uint8)
@@ -93,9 +89,9 @@ def main():
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open input video: {args.input}")
 
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    width = int(cap.get(3))
+    height = int(cap.get(4))
+    fps = cap.get(5) or 30.0
 
     writer = cv2.VideoWriter(
         args.output,
@@ -103,9 +99,6 @@ def main():
         fps,
         (width, height),
     )
-    if not writer.isOpened():
-        cap.release()
-        raise RuntimeError(f"Cannot create output video: {args.output}")
 
     detector = PlayerDetector(YOLO_MODEL_NAME, DETECTION_CLASSES)
     tracker = PlayerTracker()
@@ -128,7 +121,6 @@ def main():
             tracker.update([])
             prev_output = frame.copy()
             writer.write(frame)
-            print(f"\rFrame {frame_idx}", end="", flush=True)
             continue
 
         tracker.update(boxes)
@@ -137,7 +129,6 @@ def main():
         if not selected_indices:
             prev_output = frame.copy()
             writer.write(frame)
-            print(f"\rFrame {frame_idx}", end="", flush=True)
             continue
 
         sam_masks = sam.refine(frame, boxes)
@@ -145,9 +136,7 @@ def main():
             sam_masks = det_masks
 
         output = frame.copy()
-        combined_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
 
-        # Process larger players first.
         selected_indices = sorted(
             selected_indices,
             key=lambda i: player_area(boxes[i]),
@@ -155,6 +144,7 @@ def main():
         )
 
         for idx in selected_indices:
+
             if idx >= len(sam_masks):
                 continue
 
@@ -167,58 +157,51 @@ def main():
                     interpolation=cv2.INTER_NEAREST,
                 )
 
-            # Slight dilation to fully cover the silhouette, but not too much.
-            player_mask = cv2.dilate(player_mask, np.ones((5, 5), np.uint8), 1)
+            # mask cleanup
+            player_mask = cv2.medianBlur(player_mask, 5)
+            player_mask = cv2.dilate(player_mask, np.ones((3, 3), np.uint8), 1)
 
             if np.count_nonzero(player_mask) == 0:
                 continue
 
-            combined_mask = np.maximum(combined_mask, player_mask)
-
-            # Reuse previous clean frame when possible, then refine only where needed.
             if prev_output is not None:
+
                 warped = warp_previous(prev_output, frame)
+
                 fill = warped.copy()
                 fill[player_mask > 0] = warped[player_mask > 0]
 
-                if np.mean(fill[player_mask > 0]) < 10:
+                # reduced SD usage
+                if np.mean(fill[player_mask > 0]) < 15:
+
                     sd_out = sd.inpaint(output, player_mask)
 
-                    if sd_out is None:
+                    if sd_out is not None:
+                        output = blend_edge(output, sd_out, player_mask)
+                    else:
                         mask255 = (player_mask * 255).astype(np.uint8)
                         output = cv2.inpaint(output, mask255, 3, cv2.INPAINT_TELEA)
-                    else:
-                        output = blend_edge(output, sd_out, player_mask)
+
                 else:
                     output[player_mask > 0] = fill[player_mask > 0]
+
             else:
                 sd_out = sd.inpaint(output, player_mask)
-                if sd_out is None:
-                    mask255 = (player_mask * 255).astype(np.uint8)
-                    output = cv2.inpaint(output, mask255, 3, cv2.INPAINT_TELEA)
-                else:
+                if sd_out is not None:
                     output = blend_edge(output, sd_out, player_mask)
 
-        # Very light stabilization only inside the stable core.
-        if prev_output is not None and np.count_nonzero(combined_mask) > 0:
-            core = cv2.erode(combined_mask, np.ones((9, 9), np.uint8), 1)
-            if np.count_nonzero(core) > 0:
-                alpha = 0.05
-                alpha_map = core[..., None].astype(np.float32) * alpha
-                output = (
-                    output.astype(np.float32) * (1.0 - alpha_map)
-                    + prev_output.astype(np.float32) * alpha_map
-                )
-                output = np.clip(output, 0, 255).astype(np.uint8)
+        # subtle noise for realism
+        noise = np.random.normal(0, 2, output.shape).astype(np.int16)
+        output = np.clip(output.astype(np.int16) + noise, 0, 255).astype(np.uint8)
 
         prev_output = output.copy()
-        writer.write(output.astype(np.uint8))
+        writer.write(output)
 
-        print(f"\rFrame {frame_idx}", end="", flush=True)
+        print(f"\rFrame {frame_idx}", end="")
 
     cap.release()
     writer.release()
-    print(f"\nSaved: {args.output}")
+    print("\nSaved:", args.output)
 
 
 if __name__ == "__main__":
